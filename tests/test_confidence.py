@@ -1,6 +1,3 @@
-# tests/test_confidence.py
-import types
-
 from src.strategies.fast_text import FastTextExtractor
 
 
@@ -23,30 +20,30 @@ class DummyPDF:
         return False
 
 
-def test_fasttext_confidence_higher_with_more_text(monkeypatch):
-    """
-    Confidence should increase when there is more extracted text.
-    """
-
+def test_fasttext_confidence_higher_with_more_text(monkeypatch, tmp_path):
     extractor = FastTextExtractor()
+
+    # Create a real temporary file so Path.exists() is True
+    pdf_path = tmp_path / "dummy.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%fake\n")  # content doesn't matter; we mock pdfplumber
 
     # Mock pdfplumber.open used inside FastTextExtractor
     def fake_open(_path: str):
-        return DummyPDF(["hello world"] * 1)  # small text
+        return DummyPDF(["hello world"])  # small text
 
     monkeypatch.setattr("src.strategies.fast_text.pdfplumber.open", fake_open)
 
-    low = extractor.extract("dummy.pdf")
-    low_conf = low.confidence
+    extracted_low, _note_low = extractor.extract("doc_low", str(pdf_path))
+    low_conf = extracted_low.confidence
 
     def fake_open_more(_path: str):
-        return DummyPDF(["hello world " * 200] * 3)  # lots of text
+        return DummyPDF(["hello world " * 200] * 3)  # lots more text
 
     monkeypatch.setattr("src.strategies.fast_text.pdfplumber.open", fake_open_more)
 
-    high = extractor.extract("dummy.pdf")
-    high_conf = high.confidence
+    extracted_high, _note_high = extractor.extract("doc_high", str(pdf_path))
+    high_conf = extracted_high.confidence
 
-    assert high_conf > low_conf
     assert 0.0 <= low_conf <= 1.0
     assert 0.0 <= high_conf <= 1.0
+    assert high_conf > low_conf
