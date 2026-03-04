@@ -1,20 +1,16 @@
-# Python build artifacts
-*.egg-info/
-*.egg
-dist/
-build/
-
-# Python cache
-__pycache__/
-*.pyc
-
-# local env
-.venv/
-
 # local data
 data/raw/
-.refinery/
 
-# editor files
-.DS_Store
-*.swp
+# refinery outputs (ignore everything)
+.refinery/**
+
+# allow folders so Git can reach the files
+!.refinery/
+!.refinery/profiles/
+
+# allow only the interim-required artifacts
+!.refinery/profiles/*.json
+!.refinery/extraction_ledger.jsonl
+
+# keep extracted outputs ignored (not required / can be big)
+.refinery/extracted/
