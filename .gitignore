@@ -14,3 +14,36 @@ data/raw/
 
 # keep extracted outputs ignored (not required / can be big)
 .refinery/extracted/
+# temp files
+*.swp
+
+# python build artifacts
+*.egg-info/
+
+# stray local files
+strategy
+# caches / build
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# editor temp
+*.swp
+
+# local stray
+strategy
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+
+# Data (optional if dataset is large)
+data/
+
+# Node (for later React UI)
+node_modules/
+dist/

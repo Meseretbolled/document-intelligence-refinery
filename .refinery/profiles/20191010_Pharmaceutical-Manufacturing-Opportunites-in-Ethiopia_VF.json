@@ -1,0 +1,13 @@
+{
+  "doc_id": "20191010_Pharmaceutical-Manufacturing-Opportunites-in-Ethiopia_VF",
+  "source_path": "/home/meseret/Documents/document-intelligence-refinery/data/raw/data/20191010_Pharmaceutical-Manufacturing-Opportunites-in-Ethiopia_VF.pdf",
+  "origin_type": "native_digital",
+  "layout_complexity": "figure_heavy",
+  "language": "en",
+  "language_confidence": 0.4,
+  "domain_hint": "general",
+  "page_count": 10,
+  "avg_text_chars_per_page": 474.5,
+  "avg_image_area_ratio": 0.4311475603361193,
+  "cost_tier": "needs_layout_model"
+}

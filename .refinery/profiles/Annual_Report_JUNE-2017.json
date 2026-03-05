@@ -1,0 +1,13 @@
+{
+  "doc_id": "Annual_Report_JUNE-2017",
+  "source_path": "/home/meseret/Documents/document-intelligence-refinery/data/raw/data/Annual_Report_JUNE-2017.pdf",
+  "origin_type": "native_digital",
+  "layout_complexity": "multi_column",
+  "language": "en",
+  "language_confidence": 0.4,
+  "domain_hint": "general",
+  "page_count": 10,
+  "avg_text_chars_per_page": 1049.6,
+  "avg_image_area_ratio": 0.12105858944836574,
+  "cost_tier": "needs_layout_model"
+}
