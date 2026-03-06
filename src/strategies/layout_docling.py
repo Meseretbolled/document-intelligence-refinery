@@ -12,6 +12,52 @@ from src.utils.hashing import sha256_text
 from .base import BaseExtractor
 
 
+def _count_ethiopic_chars(text: str) -> int:
+    if not text:
+        return 0
+    return sum(1 for c in text if "\u1200" <= c <= "\u137F")
+
+
+def _count_latin_letters(text: str) -> int:
+    if not text:
+        return 0
+    return sum(1 for c in text if ("A" <= c <= "Z") or ("a" <= c <= "z"))
+
+
+def _detect_script_language(text: str) -> tuple[Optional[str], Optional[str], float]:
+    """
+    Returns:
+      (language, script, confidence)
+
+    Possible language values:
+      - "am"
+      - "en"
+      - "mixed"
+      - None
+    """
+    t = (text or "").strip()
+    if not t:
+        return None, None, 0.0
+
+    ethiopic_count = _count_ethiopic_chars(t)
+    latin_count = _count_latin_letters(t)
+    total_len = max(1, len(t))
+
+    ethiopic_ratio = ethiopic_count / total_len
+    latin_ratio = latin_count / total_len
+
+    if ethiopic_count >= 5 and latin_count >= 20:
+        return "mixed", "mixed", 0.85
+
+    if ethiopic_count >= 5 and ethiopic_ratio > 0.03:
+        return "am", "ethiopic", 0.90
+
+    if latin_count >= 20 and latin_ratio > 0.15:
+        return "en", "latin", 0.75
+
+    return None, None, 0.10
+
+
 def _chunk_markdown(md: str, max_chars: int = 1200) -> List[str]:
     """
     Split markdown into chunks that map better to LDUs:
@@ -43,7 +89,6 @@ def _chunk_markdown(md: str, max_chars: int = 1200) -> List[str]:
 
     flush()
 
-    # further split large sections by blank lines
     chunks: List[str] = []
     for sec in sections:
         parts = re.split(r"\n\s*\n", sec.strip())
@@ -54,10 +99,11 @@ def _chunk_markdown(md: str, max_chars: int = 1200) -> List[str]:
             if len(part) <= max_chars:
                 chunks.append(part)
             else:
-                # hard wrap into max_chars segments
                 start = 0
                 while start < len(part):
-                    chunks.append(part[start : start + max_chars].strip())
+                    piece = part[start : start + max_chars].strip()
+                    if piece:
+                        chunks.append(piece)
                     start += max_chars
 
     return [c for c in chunks if c]
@@ -84,11 +130,45 @@ def _confidence_from_md(md: str, chunks: List[str]) -> float:
     return 0.25
 
 
+def _ocr_quality_flags(text: str) -> List[str]:
+    """
+    Very light quality heuristics to detect noisy OCR/markdown extraction.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ["empty extracted markdown"]
+
+    reasons: List[str] = []
+
+    weird_symbols = sum(1 for c in t if c in "∞①②③④⑤⑥⑦⑧⑨○●◉◌※")
+    if weird_symbols >= 3:
+        reasons.append("contains unusual OCR symbols")
+
+    alnum = sum(1 for c in t if c.isalnum())
+    if len(t) > 0 and (alnum / len(t)) < 0.35:
+        reasons.append("low alphanumeric ratio")
+
+    ethiopic_count = _count_ethiopic_chars(t)
+    latin_count = _count_latin_letters(t)
+
+    # If there are many non-ASCII chars but almost no Ethiopic or Latin,
+    # it may indicate OCR corruption.
+    non_ascii = sum(1 for c in t if ord(c) >= 128)
+    if non_ascii >= 10 and ethiopic_count < 3 and latin_count < 10:
+        reasons.append("non-ascii text without clear script signal")
+
+    return reasons
+
+
 class DoclingLayoutExtractor(BaseExtractor):
     """
     Strategy B (Layout-aware)
     Uses Docling if installed.
-    FINAL: converts markdown into multiple blocks so LDU/PageIndex are meaningful.
+
+    Final behavior:
+    - converts Docling markdown into multiple blocks
+    - annotates extracted output with language/script hints
+    - flags likely OCR noise in metadata
     """
 
     def extract(self, doc_id: str, source_path: str) -> Tuple[ExtractedDocument, Optional[str]]:
@@ -102,11 +182,11 @@ class DoclingLayoutExtractor(BaseExtractor):
                     strategy_used="B",
                     confidence=0.0,
                     blocks=[],
+                    meta={"needs_review": True},
                 ),
                 "Docling not installed. Install with: pip install docling",
             )
 
-        # Count pages for provenance coverage
         page_count = 1
         try:
             with pdfplumber.open(source_path) as pdf:
@@ -126,6 +206,7 @@ class DoclingLayoutExtractor(BaseExtractor):
                     strategy_used="B",
                     confidence=0.0,
                     blocks=[],
+                    meta={"needs_review": True},
                 ),
                 f"Docling conversion failed: {type(e).__name__}: {e}",
             )
@@ -140,8 +221,7 @@ class DoclingLayoutExtractor(BaseExtractor):
         chunks = _chunk_markdown(md, max_chars=1200)
 
         blocks: List[ExtractedBlock] = []
-        for i, chunk in enumerate(chunks):
-            # one block per chunk for better LDUs
+        for chunk in chunks:
             blocks.append(
                 ExtractedBlock(
                     block_type="text",
@@ -157,12 +237,28 @@ class DoclingLayoutExtractor(BaseExtractor):
             )
 
         confidence = float(_confidence_from_md(md, chunks))
+        detected_language, detected_script, lang_conf = _detect_script_language(md)
+        quality_reasons = _ocr_quality_flags(md)
 
-        notes = None
+        notes: List[str] = []
         if md and len(blocks) <= 1:
-            notes = "Docling returned markdown, but chunking produced <=1 block (document may be very short)."
+            notes.append(
+                "Docling returned markdown, but chunking produced <=1 block (document may be very short)."
+            )
         if not md:
-            notes = "Docling returned empty markdown."
+            notes.append("Docling returned empty markdown.")
+        if quality_reasons:
+            notes.append("Potential OCR/layout quality issue: " + "; ".join(quality_reasons))
+
+        meta = {
+            "detected_language_after_extraction": detected_language,
+            "detected_script_after_extraction": detected_script,
+            "language_detection_confidence": float(lang_conf),
+            "ocr_quality_reasons": quality_reasons,
+            "needs_review": confidence < 0.70 or len(quality_reasons) > 0,
+            "page_count": page_count,
+            "chunk_count": len(chunks),
+        }
 
         return (
             ExtractedDocument(
@@ -171,6 +267,7 @@ class DoclingLayoutExtractor(BaseExtractor):
                 strategy_used="B",
                 confidence=confidence,
                 blocks=blocks,
+                meta=meta,
             ),
-            notes,
+            " | ".join(notes) if notes else None,
         )

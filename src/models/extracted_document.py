@@ -1,24 +1,33 @@
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
+
 from pydantic import BaseModel, Field
 
-from .provenance import ProvenanceChain
-
-
-BlockType = Literal["text", "table", "figure", "header", "footer"]
+from src.models.provenance import ProvenanceChain
 
 
 class ExtractedBlock(BaseModel):
-    block_type: BlockType
+    """
+    A single unit of extracted content.
+    """
+    block_type: Literal["text", "table", "figure", "header", "footer"]
     text: Optional[str] = None
-    html: Optional[str] = None  # for tables if available
-    provenance: ProvenanceChain
+    html: Optional[str] = None
+    provenance: Optional[ProvenanceChain] = None
 
 
 class ExtractedDocument(BaseModel):
+    """
+    Final structured output for a processed document.
+    """
     doc_id: str
     source_path: str
-    strategy_used: Literal["A", "B", "C"]
-    confidence: float = Field(..., ge=0.0, le=1.0)
+
+    strategy_used: str
+    confidence: float
+
     blocks: List[ExtractedBlock] = Field(default_factory=list)
+
+    # optional metadata for engineering decisions (budget, qa, cache, trace, etc.)
+    meta: Optional[Dict[str, Any]] = None

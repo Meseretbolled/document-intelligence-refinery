@@ -77,7 +77,8 @@ def run(
         write_json(ldu_dir / f"{profile.doc_id}.json", [l.model_dump() for l in ldus])
 
         # Stage 5: PageIndex building
-        page_index = build_page_index(profile.doc_id, profile.source_path, ldus)
+                # Stage 5: PageIndex building
+        page_index = build_page_index(profile, extracted, ldus)
         write_json(page_index_dir / f"{profile.doc_id}.json", page_index.model_dump())
 
         print(f"✅ {pdf.name} -> strategy {extracted.strategy_used}, confidence={extracted.confidence:.2f}")

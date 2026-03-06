@@ -18,11 +18,14 @@ from .base import BaseExtractor
 
 
 def _render_page_png(pdf_path: str, page_index: int, zoom: float = 2.0) -> bytes:
-    doc = pymupdf.open(pdf_path)
-    page = doc.load_page(page_index)
-    mat = pymupdf.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    return pix.tobytes("png")
+    """
+    Render one PDF page as PNG bytes.
+    """
+    with pymupdf.open(pdf_path) as doc:
+        page = doc.load_page(page_index)
+        mat = pymupdf.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        return pix.tobytes("png")
 
 
 def _strip_code_fences(text: str) -> str:
@@ -32,7 +35,11 @@ def _strip_code_fences(text: str) -> str:
     if not text:
         return text
     t = text.strip()
-    m = re.match(r"^\s*```(?:json)?\s*\n(.*)\n\s*```\s*$", t, flags=re.DOTALL | re.IGNORECASE)
+    m = re.match(
+        r"^\s*```(?:json)?\s*\n(.*)\n\s*```\s*$",
+        t,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     return m.group(1).strip() if m else t
 
 
@@ -42,12 +49,26 @@ def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
     """
     if not text:
         return None
+
     payload = _strip_code_fences(text)
+
     try:
         obj = json.loads(payload)
         return obj if isinstance(obj, dict) else None
     except Exception:
+        pass
+
+    # Extra fallback: try to extract the first {...} block
+    try:
+        start = payload.find("{")
+        end = payload.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            obj = json.loads(payload[start : end + 1])
+            return obj if isinstance(obj, dict) else None
+    except Exception:
         return None
+
+    return None
 
 
 def _confidence_from_blocks(blocks: List[ExtractedBlock]) -> float:
@@ -70,12 +91,15 @@ def _confidence_from_blocks(blocks: List[ExtractedBlock]) -> float:
 
 class VisionVLMExtractor(BaseExtractor):
     """
-    Strategy C (Vision) via OpenRouter.
+    Strategy C3 (Vision LLM) via OpenRouter.
 
     Env vars:
       - OPENROUTER_API_KEY
-      - OPENROUTER_MODEL (default: openai/gpt-4o-mini)
-      - MAX_VLM_PAGES (default: 2)  # cost-aware guardrail
+      - OPENROUTER_URL (default: https://openrouter.ai/api/v1)
+      - OPENROUTER_MODEL or MODEL_NAME
+      - MAX_VLM_PAGES (default: 2)
+      - OPENROUTER_SITE_URL (optional)
+      - OPENROUTER_APP_NAME (optional)
 
     Output:
       - multiple ExtractedBlocks with VALID block_type values only:
@@ -84,30 +108,52 @@ class VisionVLMExtractor(BaseExtractor):
 
     def extract(self, doc_id: str, source_path: str) -> Tuple[ExtractedDocument, Optional[str]]:
         api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini").strip()
+        base_url = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1").strip()
+        model = (
+            os.getenv("OPENROUTER_MODEL", "").strip()
+            or os.getenv("MODEL_NAME", "").strip()
+            or "openai/gpt-4o-mini"
+        )
         max_pages = int(os.getenv("MAX_VLM_PAGES", "2"))
+        site_url = os.getenv("OPENROUTER_SITE_URL", "").strip()
+        app_name = os.getenv("OPENROUTER_APP_NAME", "").strip()
 
         p = Path(source_path)
         if not p.exists():
             return (
-                ExtractedDocument(doc_id=doc_id, source_path=source_path, strategy_used="C", confidence=0.0, blocks=[]),
-                "Strategy C: source file not found",
+                ExtractedDocument(
+                    doc_id=doc_id,
+                    source_path=source_path,
+                    strategy_used="C",
+                    confidence=0.0,
+                    blocks=[],
+                    meta={"strategy_c_level": "C3"},
+                ),
+                "Strategy C3: source file not found",
             )
 
         if not api_key:
             return (
-                ExtractedDocument(doc_id=doc_id, source_path=source_path, strategy_used="C", confidence=0.0, blocks=[]),
-                "Strategy C not run: OPENROUTER_API_KEY not set (skipping VLM).",
+                ExtractedDocument(
+                    doc_id=doc_id,
+                    source_path=source_path,
+                    strategy_used="C",
+                    confidence=0.0,
+                    blocks=[],
+                    meta={"strategy_c_level": "C3"},
+                ),
+                "Strategy C3 not run: OPENROUTER_API_KEY not set",
             )
 
         try:
-            # Determine page count
-            doc = pymupdf.open(source_path)
-            page_count = doc.page_count
+            with pymupdf.open(source_path) as doc:
+                page_count = doc.page_count
+
             pages_to_send = min(max_pages, page_count)
 
             images_b64: List[str] = []
             spans: List[ProvenanceSpan] = []
+
             for i in range(pages_to_send):
                 png = _render_page_png(source_path, i, zoom=2.0)
                 b64 = base64.b64encode(png).decode("utf-8")
@@ -116,14 +162,17 @@ class VisionVLMExtractor(BaseExtractor):
 
             prompt = (
                 "You are a document extraction engine.\n"
-                "Return ONLY valid JSON (no markdown fences).\n"
+                "Return ONLY valid JSON with no markdown fences.\n"
                 "Schema:\n"
                 "{\n"
-                '  \"doc_type\": string,\n'
-                '  \"short_text\": string,\n'
-                '  \"key_fields\": [{\"name\": string, \"value\": string}]\n'
+                '  "doc_type": string,\n'
+                '  "short_text": string,\n'
+                '  "key_fields": [{"name": string, "value": string}]\n'
                 "}\n"
-                "If unsure, use empty strings.\n"
+                "Rules:\n"
+                "- Be faithful to the document image.\n"
+                "- If unsure, use empty strings.\n"
+                "- Do not add extra keys.\n"
             )
 
             payload = {
@@ -134,7 +183,10 @@ class VisionVLMExtractor(BaseExtractor):
                         "content": (
                             [{"type": "text", "text": prompt}]
                             + [
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                                }
                                 for b64 in images_b64
                             ]
                         ),
@@ -143,13 +195,19 @@ class VisionVLMExtractor(BaseExtractor):
                 "temperature": 0.0,
             }
 
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            if site_url:
+                headers["HTTP-Referer"] = site_url
+            if app_name:
+                headers["X-Title"] = app_name
+
             req = urllib.request.Request(
-                url="https://openrouter.ai/api/v1/chat/completions",
+                url=f"{base_url.rstrip('/')}/chat/completions",
                 data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 method="POST",
             )
 
@@ -159,11 +217,11 @@ class VisionVLMExtractor(BaseExtractor):
             dt = time.time() - t0
 
             data = json.loads(raw)
+            resolved_model = data.get("model", model)
             model_text = (data["choices"][0]["message"]["content"] or "").strip()
 
             parsed = _safe_json_loads(model_text)
 
-            # provenance shared across blocks
             doc_name = p.name
 
             def prov_for(text: str) -> ProvenanceChain:
@@ -177,11 +235,10 @@ class VisionVLMExtractor(BaseExtractor):
             blocks: List[ExtractedBlock] = []
 
             if parsed:
-                doc_type = (parsed.get("doc_type") or "").strip()
-                short_text = (parsed.get("short_text") or "").strip()
+                doc_type = str(parsed.get("doc_type") or "").strip()
+                short_text = str(parsed.get("short_text") or "").strip()
                 key_fields = parsed.get("key_fields") or []
 
-                # doc_type as HEADER (valid literal)
                 if doc_type:
                     line = f"Document Type: {doc_type}"
                     blocks.append(
@@ -193,7 +250,6 @@ class VisionVLMExtractor(BaseExtractor):
                         )
                     )
 
-                # short summary as TEXT
                 if short_text:
                     blocks.append(
                         ExtractedBlock(
@@ -204,15 +260,13 @@ class VisionVLMExtractor(BaseExtractor):
                         )
                     )
 
-                # key_fields as TABLE-style text block(s)
                 if isinstance(key_fields, list) and key_fields:
-                    # make one table-like block with multiple lines (still block_type='table')
                     lines: List[str] = []
                     for kv in key_fields:
                         if not isinstance(kv, dict):
                             continue
-                        name = (kv.get("name") or "").strip()
-                        value = (kv.get("value") or "").strip()
+                        name = str(kv.get("name") or "").strip()
+                        value = str(kv.get("value") or "").strip()
                         if not name and not value:
                             continue
                         lines.append(f"{name}: {value}".strip(": ").strip())
@@ -228,7 +282,6 @@ class VisionVLMExtractor(BaseExtractor):
                             )
                         )
 
-            # Fallback: if parse failed, store cleaned text as TEXT
             if not blocks:
                 cleaned = _strip_code_fences(model_text)
                 if cleaned:
@@ -250,18 +303,28 @@ class VisionVLMExtractor(BaseExtractor):
                     strategy_used="C",
                     confidence=conf,
                     blocks=blocks,
-                    metadata={
-                        "openrouter_model": model,
+                    meta={
+                        "strategy_c_level": "C3",
+                        "requested_model": model,
+                        "resolved_model": resolved_model,
                         "pages_sent_to_vlm": pages_to_send,
                         "page_count": page_count,
                         "latency_s": round(dt, 3),
+                        "needs_review": conf < 0.70,
                     },
                 ),
-                f"Strategy C used OpenRouter model={model} (pages_sent={pages_to_send})",
+                f"Strategy C3 used OpenRouter model={resolved_model} (requested={model}, pages_sent={pages_to_send})",
             )
 
         except Exception as e:
             return (
-                ExtractedDocument(doc_id=doc_id, source_path=source_path, strategy_used="C", confidence=0.0, blocks=[]),
-                f"Strategy C failed: {type(e).__name__}: {e}",
+                ExtractedDocument(
+                    doc_id=doc_id,
+                    source_path=source_path,
+                    strategy_used="C",
+                    confidence=0.0,
+                    blocks=[],
+                    meta={"strategy_c_level": "C3", "needs_review": True},
+                ),
+                f"Strategy C3 failed: {type(e).__name__}: {e}",
             )

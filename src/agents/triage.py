@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional
 
-from src.models.document_profile import DocumentProfile
+from src.models.profile import DocumentProfile
 from src.utils.pdf_signals import compute_pdf_signals
 from src.utils.pdf_layout import compute_layout_signals
-
 
 _DOMAIN_KEYWORDS = {
     "financial": ["balance sheet", "income statement", "profit", "loss", "revenue", "fiscal", "tax"],
@@ -16,27 +15,93 @@ _DOMAIN_KEYWORDS = {
 }
 
 
+def _count_ethiopic_chars(text: str) -> int:
+    """
+    Counts characters in the Ethiopic Unicode block.
+    Covers the main Ethiopic range used by Amharic text.
+    """
+    if not text:
+        return 0
+    return sum(1 for c in text if "\u1200" <= c <= "\u137F")
+
+
+def _count_latin_letters(text: str) -> int:
+    """
+    Counts basic Latin alphabet letters.
+    """
+    if not text:
+        return 0
+    return sum(1 for c in text if ("A" <= c <= "Z") or ("a" <= c <= "z"))
+
+
+def _looks_ethiopic(text: str, min_chars: int = 5) -> bool:
+    """
+    True if the text contains enough Ethiopic characters to strongly suggest
+    Amharic/Ethiopic script presence.
+    """
+    return _count_ethiopic_chars(text) >= min_chars
+
+
 def _detect_language(text_sample: str) -> tuple[Optional[str], float]:
     """
-    Optional: uses langdetect if installed; otherwise returns a safe fallback.
+    Language detection with Ethiopic/Amharic-aware overrides.
+
+    Returns:
+      - "am" for clearly Ethiopic-script text
+      - "mixed" for strong English + Ethiopic coexistence
+      - detected language from langdetect if available
+      - safe fallback otherwise
     """
     sample = (text_sample or "").strip()
     if not sample:
         return None, 0.0
 
+    ethiopic_count = _count_ethiopic_chars(sample)
+    latin_count = _count_latin_letters(sample)
+    total_len = max(1, len(sample))
+
+    ethiopic_ratio = ethiopic_count / total_len
+    latin_ratio = latin_count / total_len
+
+    # Strong bilingual / mixed-language signal
+    if ethiopic_count >= 5 and latin_count >= 20:
+        return "mixed", 0.85
+
+    # Strong Ethiopic script signal
+    if ethiopic_count >= 5 and ethiopic_ratio > 0.05:
+        return "am", 0.90
+
     try:
         from langdetect import detect_langs  # type: ignore
+
         langs = detect_langs(sample[:2000])
-        if not langs:
-            return None, 0.0
-        top = langs[0]
-        return str(top.lang), float(top.prob)
+        if langs:
+            top = langs[0]
+            detected_lang = str(top.lang)
+            detected_prob = float(top.prob)
+
+            # Safety override: if langdetect misses Ethiopic but text clearly has it
+            if ethiopic_count >= 5:
+                if latin_count >= 20:
+                    return "mixed", max(detected_prob, 0.80)
+                return "am", max(detected_prob, 0.80)
+
+            return detected_lang, detected_prob
+
     except Exception:
-        # fallback: assume English if mostly ASCII letters
-        ascii_ratio = sum(1 for c in sample if ord(c) < 128) / max(1, len(sample))
-        if ascii_ratio > 0.95:
-            return "en", 0.40
-        return None, 0.10
+        pass
+
+    # Fallback heuristics
+    if ethiopic_count >= 5:
+        if latin_count >= 20:
+            return "mixed", 0.80
+        return "am", 0.80
+
+    ascii_ratio = sum(1 for c in sample if ord(c) < 128) / max(1, len(sample))
+    if ascii_ratio > 0.95 or latin_ratio > 0.30:
+        return "en", 0.40
+
+    return None, 0.10
 
 
 def _detect_domain(text_sample: str) -> Optional[str]:
@@ -59,6 +124,11 @@ def triage_pdf(pdf_path: str, rules: dict) -> DocumentProfile:
     """
     Stage 1: Triage Agent
     Produces DocumentProfile which governs strategy routing.
+
+    Notes:
+    - For digital PDFs, language detection can work directly from the text layer.
+    - For scanned PDFs, text_sample may be empty before OCR; in that case language
+      may still be None at triage time and can be updated later after extraction.
     """
     path = Path(pdf_path)
     doc_id = path.stem
@@ -85,10 +155,11 @@ def triage_pdf(pdf_path: str, rules: dict) -> DocumentProfile:
     else:
         layout_complexity = "single_column"
 
-    # Collect a tiny text sample for language/domain hints (safe even if scanned)
+    # Collect a tiny text sample for language/domain hints
     text_sample = ""
     try:
-        import pdfplumber  # local dependency already in your pyproject
+        import pdfplumber
+
         with pdfplumber.open(str(path)) as pdf:
             for p in pdf.pages[:2]:
                 t = (p.extract_text() or "").strip()

@@ -1,12 +1,12 @@
 {
-  "doc_id": "2013-E.C-Assigned-regular-budget-and-expense",
-  "source_path": "data/raw/data/2013-E.C-Assigned-regular-budget-and-expense.pdf",
+  "doc_id": "CBE Annual Report 2014-15",
+  "source_path": "data/raw/data/CBE Annual Report 2014-15.pdf",
   "origin_type": "scanned_image",
   "layout_complexity": "figure_heavy",
   "language": null,
   "language_confidence": 0.0,
   "domain_hint": null,
-  "page_count": 3,
+  "page_count": 30,
   "avg_text_chars_per_page": 0.0,
   "avg_image_area_ratio": 1.0,
   "cost_tier": "needs_vision_model"

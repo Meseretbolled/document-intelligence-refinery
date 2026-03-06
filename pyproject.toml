@@ -7,7 +7,7 @@ name = "document-intelligence-refinery"
 version = "0.1.0"
 description = "TRP1 Week 3 - Document Intelligence Refinery (Interim: Phase 0/1/2)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python=">=3.10,<4.0"
 dependencies = [
   "pydantic>=2.7.0",
   "pydantic-settings>=2.3.0",
@@ -17,6 +17,7 @@ dependencies = [
   "pdfplumber>=0.11.4",
   "pymupdf>=1.24.9",
   "python-dotenv>=1.0.1",
+  
 ]
 
 [project.optional-dependencies]
@@ -38,7 +39,7 @@ line-length = 100
 target-version = "py310"
 
 [tool.mypy]
-python_version = "3.10"
+ python = ">=3.10,<4.0"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

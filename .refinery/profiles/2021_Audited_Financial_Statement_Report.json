@@ -1,6 +1,6 @@
 {
   "doc_id": "2021_Audited_Financial_Statement_Report",
-  "source_path": "/home/meseret/Documents/document-intelligence-refinery/data/raw/data/2021_Audited_Financial_Statement_Report.pdf",
+  "source_path": "data/raw/data/2021_Audited_Financial_Statement_Report.pdf",
   "origin_type": "scanned_image",
   "layout_complexity": "figure_heavy",
   "language": null,

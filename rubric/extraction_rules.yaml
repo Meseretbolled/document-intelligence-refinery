@@ -4,15 +4,20 @@ triage:
     text_chars_per_page_lte: 300
 
 confidence:
-  strategy_a_min_confidence: 0.60
-  strategy_b_min_confidence: 0.70
+  strategy_a_min_confidence: 0.6
+  strategy_b_min_confidence: 0.7
 
 escalation:
   allow_a_to_b: true
-  allow_b_to_c: false
+  allow_b_to_c: true
   max_attempts: 2
 
 cost_estimates_usd:
   strategy_a: 0.001
   strategy_b: 0.01
   strategy_c: 0.10
+
+chunking:
+  max_chars: 1200
+  min_chars: 120
+  overlap_chars: 100
