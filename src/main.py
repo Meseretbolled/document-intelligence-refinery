@@ -77,22 +77,37 @@ def query(
         print("[red]Document not processed yet. Run: python -m src.main run --input-path <pdf>[/red]")
         raise typer.Exit(1)
     result = agent.ask(question, top_k=5)
-    print(f"\n[bold]Question:[/bold] {result['question']}")
-    print(f"[bold]Tools used:[/bold] {', '.join(result['tools_used'])}")
-    print("\n[bold]Answer snippets:[/bold]")
-    for i, snippet in enumerate(result["answer_snippets"], 1):
-        print(f"  {i}. {snippet[:200]}")
-    print("\n[bold]Provenance:[/bold]")
-    for prov in result["provenance_chain"]:
-        spans = prov.get("spans", [])
-        page = spans[0].get("page", "?") if spans else "?"
-        bbox = spans[0].get("bbox") if spans else None
-        h = (prov.get("content_hash") or "")[:12]
-        print(f"  - {prov.get('document_name','?')}  page={page}  bbox={bbox}  hash={h}...")
+    print(f"\n[bold cyan]Question:[/bold cyan] {result['question']}")
+    print(f"[dim]Tools used: {', '.join(result['tools_used'])}[/dim]")
+
+    # Synthesized answer
+    print(f"\n[bold green]Answer:[/bold green]")
+    print(f"  {result.get('answer', '(no answer synthesized)')}")
+
+    # Provenance
+    print("\n[bold]Provenance (source citations):[/bold]")
+    provenance_chain = result.get("provenance_chain", [])
+    if provenance_chain:
+        for prov in provenance_chain:
+            spans = prov.get("spans", [])
+            page = spans[0].get("page", "?") if spans else "?"
+            bbox = spans[0].get("bbox") if spans else None
+            h = (prov.get("content_hash") or "")[:12]
+            print(f"  - {prov.get('document_name','?')}  page={page}  bbox={bbox}  hash={h}...")
+    else:
+        print("  (no provenance - run pipeline first to index this document)")
+
+    # Structured facts
     if result.get("structured_facts"):
-        print("\n[bold]Structured facts:[/bold]")
+        print("\n[bold]Structured facts (SQLite FactTable):[/bold]")
         for f in result["structured_facts"][:5]:
             print(f"  - {f.get('field_name')}: {f.get('value')} ({f.get('unit', '')})")
+
+    # Raw snippets for debugging
+    if result.get("answer_snippets"):
+        print("\n[dim]Raw evidence snippets:[/dim]")
+        for i, snippet in enumerate(result["answer_snippets"], 1):
+            print(f"  [dim]{i}. {snippet[:200]}[/dim]")
 
 
 @app.command()

@@ -422,12 +422,25 @@ class QueryAgent:
 
     def ask(self, question: str, top_k: int = 5) -> Dict[str, Any]:
         """
-        Main entry point: routes through all three tools and synthesises answer.
-        Always returns a ProvenanceChain in the response.
+        Main entry point: three-tool agent pipeline with LLM synthesis.
+
+        Tool execution order:
+          1. pageindex_navigate  — finds relevant sections in the document tree
+          2. semantic_search     — retrieves best matching LDU chunks via ChromaDB
+          3. structured_query    — queries SQLite FactTable for numerical facts
+                                   (only triggered when question contains financial keywords)
+
+        After tool execution, all retrieved evidence is passed to an LLM which
+        synthesises a single, grounded answer. Falls back to best snippet if no
+        API key is set. Always returns a ProvenanceChain.
         """
-        nav    = self.pageindex_navigate(topic=question)
+        # ── Tool 1: PageIndex navigation ──────────────────────────────────────
+        nav = self.pageindex_navigate(topic=question)
+
+        # ── Tool 2: Semantic search ───────────────────────────────────────────
         search = self.semantic_search(question, top_k)
 
+        # ── Tool 3: Structured query (financial/numerical questions only) ─────
         structured: Optional[Dict] = None
         number_keywords = re.findall(
             r"\b(?:revenue|profit|loss|expenditure|total|amount|cost|"
@@ -437,20 +450,91 @@ class QueryAgent:
         if number_keywords:
             structured = self.structured_query(number_keywords[0])
 
-        top_results  = search.get("results", [])
-        top_sections = nav.get("results", [])
+        top_results    = search.get("results", [])
+        top_sections   = nav.get("results", [])
         answer_parts   = [r["snippet"] for r in top_results[:3]]
         all_provenance = [r["provenance"] for r in top_results[:3]]
+        structured_facts = (structured or {}).get("results", [])[:5]
+
+        # ── LLM synthesis: turn retrieved evidence into a real answer ─────────
+        synthesized_answer = self._synthesize_answer(
+            question=question,
+            snippets=answer_parts,
+            structured_facts=structured_facts,
+            sections=top_sections,
+        )
+
+        tools_used = ["pageindex_navigate", "semantic_search"]
+        if structured:
+            tools_used.append("structured_query")
 
         return {
             "question": question,
-            "answer_snippets": answer_parts,
+            "answer": synthesized_answer,           # ← real synthesised answer
+            "answer_snippets": answer_parts,        # ← raw evidence chunks
             "provenance_chain": all_provenance,
             "navigation_hits": top_sections,
-            "structured_facts": (structured or {}).get("results", [])[:5],
-            "tools_used": ["pageindex_navigate", "semantic_search"]
-            + (["structured_query"] if structured else []),
+            "structured_facts": structured_facts,
+            "tools_used": tools_used,
         }
+
+    def _synthesize_answer(
+        self,
+        question: str,
+        snippets: List[str],
+        structured_facts: List[Dict[str, Any]],
+        sections: List[Dict[str, Any]],
+    ) -> str:
+        """
+        Call the LLM to synthesise a grounded answer from retrieved evidence.
+        Falls back to the best snippet if no API key is available.
+        """
+        if not snippets and not structured_facts:
+            return "No relevant content found in the document for this question."
+
+        # Build evidence block for the prompt
+        evidence_parts = []
+        for i, s in enumerate(snippets, 1):
+            if s.strip():
+                evidence_parts.append(f"[Evidence {i}]\n{s.strip()[:600]}")
+
+        if structured_facts:
+            facts_text = "\n".join(
+                f"  - {f.get('field_name', '')}: {f.get('value', '')} {f.get('unit', '') or ''}"
+                for f in structured_facts[:5]
+            )
+            evidence_parts.append(f"[Structured Facts from document]\n{facts_text}")
+
+        if sections:
+            sec_text = ", ".join(
+                f"'{s.get('title', '')}' (p.{s.get('page_start', '?')})"
+                for s in sections[:2]
+            )
+            evidence_parts.append(f"[Relevant sections found]\n{sec_text}")
+
+        evidence_block = "\n\n".join(evidence_parts)
+
+        prompt = (
+            f"You are a document analyst. Answer the question below using ONLY "
+            f"the evidence provided. Be concise and specific. "
+            f"If the evidence does not contain the answer, say so clearly.\n\n"
+            f"Question: {question}\n\n"
+            f"Evidence from document:\n{evidence_block}\n\n"
+            f"Answer:"
+        )
+
+        api_key = os.getenv("OPENROUTER_API_KEY", "")
+        if not api_key:
+            # No API key — return best snippet as fallback
+            return snippets[0][:500] if snippets else "No content retrieved."
+
+        synthesized = _call_openrouter(prompt, max_tokens=300)
+
+        if not synthesized:
+            # API call failed — return best snippet
+            return snippets[0][:500] if snippets else "No content retrieved."
+
+        return synthesized
 
     # ── Audit Mode ────────────────────────────────────────────────────────────
 
