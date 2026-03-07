@@ -119,6 +119,29 @@ def run_refinery_on_pdf(pdf_path: str) -> RefineryOutputs:
 
     # Auto-generate 3 Q&A pairs
     _generate_and_save_qa(agent, profile.doc_id, qa_dir)
+    # Write to extraction_ledger.jsonl
+    import time as _time
+    from src.models.ledger import ExtractionLedgerEvent
+    from src.utils.io import append_jsonl
+
+    ledger_event = ExtractionLedgerEvent(
+        doc_id=profile.doc_id,
+        source_path=pdf_path,
+        strategy_used=extracted.strategy_used,
+        confidence=extracted.confidence,
+        escalated=extracted.strategy_used in ("B", "C"),
+        cost_estimate_usd=(extracted.meta or {}).get("estimated_vision_cost_usd", 0.0),
+        processing_time_s=round((extracted.meta or {}).get("latency_s", 0.0), 3),
+        notes=notes,
+        signals={
+            "origin_type": profile.origin_type,
+            "layout_complexity": profile.layout_complexity,
+            "avg_text_chars_per_page": profile.avg_text_chars_per_page,
+            "avg_image_area_ratio": profile.avg_image_area_ratio,
+        },
+    )
+    ledger_path = root / ".refinery" / "extraction_ledger.jsonl"
+    append_jsonl(ledger_path, ledger_event.model_dump())
 
     return RefineryOutputs(
         profile_path=profile_path,
