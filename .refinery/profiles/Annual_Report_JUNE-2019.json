@@ -1,0 +1,13 @@
+{
+  "doc_id": "Annual_Report_JUNE-2019",
+  "source_path": "data/raw/data/Annual_Report_JUNE-2019.pdf",
+  "origin_type": "native_digital",
+  "layout_complexity": "multi_column",
+  "language": "en",
+  "language_confidence": 0.4,
+  "domain_hint": "technical",
+  "page_count": 32,
+  "avg_text_chars_per_page": 2517.7,
+  "avg_image_area_ratio": 0.1243874734561228,
+  "cost_tier": "needs_layout_model"
+}
