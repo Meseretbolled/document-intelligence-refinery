@@ -1,91 +1,147 @@
 from __future__ import annotations
 
 from dotenv import load_dotenv
-
-load_dotenv()  # loads .env so OPENROUTER_* is available
+load_dotenv()
 
 from pathlib import Path
 from typing import Optional
 
 import typer
 from rich import print
+from rich.console import Console
+from rich.table import Table
 
-from src.settings import settings
-from src.utils.io import write_json, ensure_dir
-from src.agents.triage import triage_pdf
-from src.agents.extractor import ExtractionRouter
-from src.agents.ldu_builder import build_ldus
-from src.agents.page_indexer import build_page_index
+from src.service.refinery_service import run_refinery_on_pdf, get_query_agent
 
+console = Console()
 app = typer.Typer(no_args_is_help=True)
 
 
+# ── run: process one or more PDFs through the full 5-stage pipeline ───────────
+
 @app.command()
 def run(
-    input_path: str = typer.Option(..., help="Path to a PDF file or a folder containing PDFs."),
-    limit: Optional[int] = typer.Option(None, help="Limit number of PDFs processed."),
+    input_path: str = typer.Option(..., help="Path to a PDF file or folder of PDFs."),
+    limit: Optional[int] = typer.Option(None, help="Max number of PDFs to process."),
 ):
     """
-    Week 3 Final: Triage + Routing + Extraction + LDU + PageIndex artifacts.
+    Full 5-stage pipeline for one or more PDFs.
 
-    Writes:
-      - .refinery/profiles/{doc_id}.json
-      - .refinery/extracted/{doc_id}.json
-      - .refinery/ldu/{doc_id}.json
-      - .refinery/page_index/{doc_id}.json
-      - .refinery/extraction_ledger.jsonl (append)
+    Writes per document:
+      .refinery/profiles/{doc_id}.json
+      .refinery/extracted/{doc_id}.json
+      .refinery/ldu/{doc_id}.json
+      .refinery/pageindex/{doc_id}.json
+      .refinery/qa/{doc_id}.json
+      .refinery/chroma/                  (ChromaDB vector store)
+      .refinery/facts.db                 (SQLite FactTable)
+      .refinery/extraction_ledger.jsonl  (appended)
     """
-    rules = settings.load_rules()
-    router = ExtractionRouter(rules)
-
-    root = settings.project_root
-
-    profiles_dir = root / settings.profiles_dir
-    extracted_dir = root / settings.extracted_dir
-
-    # NEW final-stage artifact dirs
-    ldu_dir = root / ".refinery/ldu"
-    page_index_dir = root / ".refinery/page_index"
-
-    ensure_dir(profiles_dir)
-    ensure_dir(extracted_dir)
-    ensure_dir(ldu_dir)
-    ensure_dir(page_index_dir)
-
     p = Path(input_path)
     pdfs = [p] if p.is_file() else sorted(list(p.glob("*.pdf")))
-
     if limit:
         pdfs = pdfs[:limit]
 
     if not pdfs:
         raise typer.BadParameter("No PDFs found at input_path.")
 
-    print(f"[bold]Processing {len(pdfs)} PDF(s)...[/bold]")
+    print(f"[bold cyan]Processing {len(pdfs)} PDF(s)...[/bold cyan]\n")
 
     for pdf in pdfs:
-        # Stage 1: Triage
-        profile = triage_pdf(str(pdf), rules)
-        write_json(profiles_dir / f"{profile.doc_id}.json", profile.model_dump())
+        print(f"[bold]>> {pdf.name}[/bold]")
+        try:
+            out = run_refinery_on_pdf(str(pdf))
 
-        # Stage 2/3: Strategy routing + Extraction
-        extracted, notes = router.route(profile)
-        write_json(extracted_dir / f"{profile.doc_id}.json", extracted.model_dump())
+            t = Table(show_header=False, padding=(0, 1))
+            t.add_row("Strategy",   str(out.extracted.get("strategy_used")))
+            t.add_row("Confidence", f"{out.extracted.get('confidence', 0.0):.2f}")
+            t.add_row("Blocks",     str(len(out.extracted.get("blocks") or [])))
+            t.add_row("LDUs",       str(len(out.ldus)))
+            t.add_row("Violations", str(len(out.chunk_violations)))
+            console.print(t)
 
-        # Stage 4: LDU building
-        ldus = build_ldus(extracted)
-        write_json(ldu_dir / f"{profile.doc_id}.json", [l.model_dump() for l in ldus])
+            if out.notes:
+                print(f"  [yellow]notes:[/yellow] {out.notes}")
+            if out.chunk_violations:
+                print(f"  [red]chunk violations ({len(out.chunk_violations)}):[/red]")
+                for v in out.chunk_violations[:5]:
+                    print(f"    - {v}")
+            print(f"  [green]artifacts written[/green]\n")
 
-        # Stage 5: PageIndex building
-                # Stage 5: PageIndex building
-        page_index = build_page_index(profile, extracted, ldus)
-        write_json(page_index_dir / f"{profile.doc_id}.json", page_index.model_dump())
+        except Exception as exc:
+            print(f"  [red]ERROR:[/red] {exc}\n")
 
-        print(f"✅ {pdf.name} -> strategy {extracted.strategy_used}, confidence={extracted.confidence:.2f}")
-        print(f"   artifacts: profile + extracted + ldu + page_index")
 
-        if notes:
-            print(f"[yellow]notes:[/yellow] {notes}")
+# ── query: ask a natural language question against a processed document ────────
+
+@app.command()
+def query(
+    pdf_path: str = typer.Option(..., help="Path to an already-processed PDF."),
+    question: str = typer.Option(..., help="Natural language question."),
+):
+    """
+    Ask a question against a previously processed document.
+    Run `run --input-path <pdf>` first to process it.
+    """
+    agent = get_query_agent(pdf_path)
+    if agent is None:
+        print("[red]Document not processed yet. Run: python -m src.main run --input-path <pdf>[/red]")
+        raise typer.Exit(1)
+
+    result = agent.ask(question, top_k=5)
+
+    print(f"\n[bold]Question:[/bold] {result['question']}")
+    print(f"[bold]Tools used:[/bold] {', '.join(result['tools_used'])}")
+
+    print("\n[bold]Answer snippets:[/bold]")
+    for i, snippet in enumerate(result["answer_snippets"], 1):
+        print(f"  {i}. {snippet[:200]}")
+
+    print("\n[bold]Provenance:[/bold]")
+    for prov in result["provenance_chain"]:
+        doc_name = prov.get("document_name", "?")
+        spans = prov.get("spans", [])
+        page = spans[0].get("page", "?") if spans else "?"
+        bbox = spans[0].get("bbox") if spans else None
+        h = (prov.get("content_hash") or "")[:12]
+        print(f"  - {doc_name}  page={page}  bbox={bbox}  hash={h}...")
+
+    if result.get("structured_facts"):
+        print("\n[bold]Structured facts:[/bold]")
+        for f in result["structured_facts"][:5]:
+            print(f"  - {f.get('field_name')}: {f.get('value')} ({f.get('unit', '')})")
+
+
+# ── audit: verify a factual claim against the document corpus ─────────────────
+
+@app.command()
+def audit(
+    pdf_path: str = typer.Option(..., help="Path to an already-processed PDF."),
+    claim: str = typer.Option(..., help="Factual claim to verify."),
+):
+    """
+    Audit Mode: verify whether a claim is supported by the document.
+    Returns verdict: verified | unverifiable | not_found
+    """
+    agent = get_query_agent(pdf_path)
+    if agent is None:
+        print("[red]Document not processed yet. Run: python -m src.main run --input-path <pdf>[/red]")
+        raise typer.Exit(1)
+
+    result = agent.verify_claim(claim)
+
+    color = {"verified": "green", "unverifiable": "yellow", "not_found": "red"}.get(
+        result.verdict, "white"
+    )
+    print(f"\n[bold]Claim:[/bold] {result.claim}")
+    print(f"[bold]Verdict:[/bold] [{color}]{result.verdict.upper()}[/{color}]")
+    print(f"[bold]Confidence:[/bold] {result.confidence:.3f}")
+    print(f"[bold]Explanation:[/bold] {result.explanation}")
+
+    if result.evidence:
+        print("\n[bold]Evidence provenance:[/bold]")
+        for ev in result.evidence:
+            print(f"  - {ev}")
 
 
 if __name__ == "__main__":

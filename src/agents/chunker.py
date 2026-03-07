@@ -1,17 +1,25 @@
-"""
-Semantic Chunking Engine — enforces all 5 chunking rules from the constitution.
+"""""
+Semantic Chunking Engine — enforces all 5 chunking rules.
 
 Rules:
   R1: A table cell is never split from its header row.
-      → Tables are always emitted as standalone LDUs, never merged.
+      -> Tables are always emitted as standalone LDUs, never merged.
   R2: A figure caption is always stored as metadata of its parent figure chunk.
-      → Figures absorb immediately-following caption text blocks.
+      -> Figures absorb immediately-following caption text blocks.
   R3: A numbered list is always kept as a single LDU unless it exceeds max_tokens.
-      → List-type chunks are not split unless they exceed max_chars.
+      -> List-type chunks are not split unless they exceed max_chars.
   R4: Section headers are stored as parent_section metadata on all child chunks.
-      → Headers update the running parent_section context; never merged into text.
+      -> Headers update the running parent_section context; never merged into text.
   R5: Cross-references ("see Table 3", "see Figure 2") are stored as chunk relationships.
-      → Detected cross-references are added to LDU provenance meta.
+      -> Detected cross-references are added to LDU provenance.cross_refs.
+
+FIX for R5 violations ("cross-refs not stored in meta"):
+  The previous _apply_cross_refs() tried to write into provenance.model_extra which is
+  None on Pydantic models unless extra="allow" is set. This silently did nothing.
+  Fix 1: provenance.py now has model_config = ConfigDict(extra="allow") AND an explicit
+          cross_refs: List[str] field on ProvenanceChain.
+  Fix 2: _apply_cross_refs() now writes to the explicit provenance.cross_refs field.
+  Fix 3: _get_cross_refs() now reads from the same explicit field.
 """
 from __future__ import annotations
 
@@ -62,16 +70,12 @@ class ChunkValidator:
         return bool(re.match(r"^(Figure|Fig\.?|Table|Exhibit|Chart)\s*\d+", text, re.I))
 
     def can_merge(self, buf: list[LDU], candidate: LDU) -> bool:
-        """Returns True iff candidate may be merged into the current buffer."""
         if not buf:
             return True
-        # R1: tables never merged
         if self.is_table(candidate) or self.is_table(buf[-1]):
             return False
-        # R4: headers never merged into text body
         if self.is_header(candidate) or self.is_header(buf[-1]):
             return False
-        # R2: figures are standalone
         if self.is_figure(candidate) or self.is_figure(buf[-1]):
             return False
         curr_chars = sum(len(x.content or "") for x in buf)
@@ -95,7 +99,7 @@ class ChunkValidator:
                     f"got '{ldu.parent_section}')"
                 )
 
-            # R1: tables must not be chunk_type='text'
+            # R1: tables must not be empty
             if ldu.chunk_type == "table" and not (ldu.content or "").strip():
                 violations.append(f"R1 violation at LDU {i}: empty table LDU")
 
@@ -113,8 +117,17 @@ class ChunkValidator:
 
 
 def _get_cross_refs(ldu: LDU) -> list:
+    """Read cross_refs from provenance — uses explicit field (FIX for R5)."""
     try:
-        return (ldu.provenance.model_extra or {}).get("cross_refs") or []
+        if ldu.provenance is None:
+            return []
+        # First try the explicit field added in provenance.py
+        stored = getattr(ldu.provenance, "cross_refs", None)
+        if stored:
+            return stored
+        # Fallback: check model_extra in case old provenance objects are used
+        extra = ldu.provenance.model_extra or {}
+        return extra.get("cross_refs") or []
     except Exception:
         return []
 
@@ -127,9 +140,26 @@ def _annotate_section(ldu: LDU, section: Optional[str]) -> LDU:
 
 
 def _apply_cross_refs(ldu: LDU) -> None:
-    """Store detected cross-references in provenance meta (R5, best-effort in-place)."""
+    """
+    Store detected cross-references in provenance (R5).
+
+    FIX: Writes to provenance.cross_refs explicit field instead of model_extra.
+    provenance.py must have model_config = ConfigDict(extra="allow") and
+    cross_refs: List[str] field for this to work.
+    """
     refs = CROSS_REF_PATTERN.findall(ldu.content or "")
-    if refs and ldu.provenance:
+    if not refs or ldu.provenance is None:
+        return
+    try:
+        # Use the explicit cross_refs field on ProvenanceChain
+        existing = list(getattr(ldu.provenance, "cross_refs", None) or [])
+        # Merge without duplicates, preserving order
+        for r in refs:
+            if r not in existing:
+                existing.append(r)
+        ldu.provenance.cross_refs = existing
+    except Exception:
+        # Last resort: try model_extra
         try:
             extra = ldu.provenance.model_extra
             if extra is not None:
@@ -204,7 +234,7 @@ class SemanticChunkingEngine:
         while i < len(ldus):
             ldu = ldus[i]
 
-            # R4: header → update running section, emit standalone
+            # R4: header -> update running section, emit standalone
             if self.validator.is_header(ldu):
                 flush()
                 current_section = (ldu.content or "").strip()
@@ -214,7 +244,7 @@ class SemanticChunkingEngine:
                 i += 1
                 continue
 
-            # R1: table → always standalone
+            # R1: table -> always standalone
             if self.validator.is_table(ldu):
                 flush()
                 ldu = _annotate_section(ldu, current_section)
@@ -223,7 +253,7 @@ class SemanticChunkingEngine:
                 i += 1
                 continue
 
-            # R2: figure → absorb next caption if present
+            # R2: figure -> absorb next caption if present
             if self.validator.is_figure(ldu):
                 flush()
                 fig_ldu = _annotate_section(ldu, current_section)
@@ -240,7 +270,7 @@ class SemanticChunkingEngine:
                 out.append(fig_ldu)
                 continue
 
-            # R3: list → keep as single LDU unless oversized
+            # R3: list -> keep as single LDU unless oversized
             if self.validator.is_list(ldu):
                 flush()
                 ldu = _annotate_section(ldu, current_section)

@@ -1,19 +1,5 @@
-"""
-Query Interface Agent — Stage 5.
-
-Three tools:
-  1. pageindex_navigate  — hierarchical section tree traversal
-  2. semantic_search     — vector similarity search (ChromaDB) with keyword fallback
-  3. structured_query    — SQL over SQLite FactTable
-
-Every answer includes a ProvenanceChain with document_name, page_number, bbox, content_hash.
-
-Also provides:
-  - AuditMode.verify_claim(claim) → verifies a factual claim against the corpus
-"""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -25,6 +11,37 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.models.ldu import LDU
 from src.models.pageindex import PageIndex, SectionNode
 from src.models.provenance import ProvenanceChain, ProvenanceSpan
+
+
+# ── LLM helper ────────────────────────────────────────────────────────────────
+
+def _call_openrouter(prompt: str, max_tokens: int = 20) -> str:
+    """
+    Call OpenRouter. Returns text content or empty string on any failure.
+    Requires OPENROUTER_API_KEY environment variable.
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        return ""
+    try:
+        import httpx
+        resp = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": os.getenv("MODEL_NAME", "openrouter/auto:free"),
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return ""
 
 
 # ── Provenance helpers ────────────────────────────────────────────────────────
@@ -42,7 +59,7 @@ def _build_provenance(ldu: LDU, source_path: str) -> Dict[str, Any]:
         for p in ldu.page_refs:
             spans.append({
                 "page": p,
-                "bbox": ldu.bounding_box,
+                "bbox": ldu.bounding_box,  # FIX 3 in ldu_builder ensures non-null
             })
     return {
         "document_name": Path(source_path).name,
@@ -53,7 +70,7 @@ def _build_provenance(ldu: LDU, source_path: str) -> Dict[str, Any]:
     }
 
 
-# ── Vector store (ChromaDB with keyword fallback) ─────────────────────────────
+# ── Vector store ──────────────────────────────────────────────────────────────
 
 class VectorStore:
     """
@@ -82,11 +99,9 @@ class VectorStore:
         self._ldus = ldus
         if self._fallback or self._collection is None:
             return len(ldus)
-
         try:
             existing_ids = set(self._collection.get(include=[])["ids"])
             to_add_docs, to_add_ids, to_add_metas = [], [], []
-
             for ldu in ldus:
                 if ldu.ldu_id in existing_ids:
                     continue
@@ -102,9 +117,12 @@ class VectorStore:
                     "content_hash": ldu.content_hash,
                     "source_path": source_path,
                 })
-
             if to_add_docs:
-                self._collection.add(documents=to_add_docs, ids=to_add_ids, metadatas=to_add_metas)
+                self._collection.add(
+                    documents=to_add_docs,
+                    ids=to_add_ids,
+                    metadatas=to_add_metas,
+                )
             return len(to_add_docs)
         except Exception:
             self._fallback = True
@@ -116,13 +134,10 @@ class VectorStore:
             return self._keyword_search(query, top_k)
         try:
             results = self._collection.query(query_texts=[query], n_results=min(top_k, 10))
-            ids = results.get("ids", [[]])[0]
+            ids       = results.get("ids", [[]])[0]
             distances = results.get("distances", [[]])[0]
-            metas = results.get("metadatas", [[]])[0]
-            return [
-                (ids[i], 1.0 - distances[i], metas[i])
-                for i in range(len(ids))
-            ]
+            metas     = results.get("metadatas", [[]])[0]
+            return [(ids[i], 1.0 - distances[i], metas[i]) for i in range(len(ids))]
         except Exception:
             return self._keyword_search(query, top_k)
 
@@ -131,16 +146,16 @@ class VectorStore:
         hits: List[Tuple[str, float, LDU]] = []
         for ldu in self._ldus:
             text = (ldu.content or "").lower()
-            score = 0.0
-            for word in q.split():
-                score += text.count(word)
+            score = sum(text.count(word) for word in q.split())
             if score > 0:
                 hits.append((ldu.ldu_id, score / max(1, len(q.split())), ldu))
         hits.sort(key=lambda x: x[1], reverse=True)
         return [
-            (h[0], h[1], {"chunk_type": h[2].chunk_type,
-                          "page_refs": json.dumps(h[2].page_refs),
-                          "content_hash": h[2].content_hash})
+            (h[0], h[1], {
+                "chunk_type": h[2].chunk_type,
+                "page_refs": json.dumps(h[2].page_refs),
+                "content_hash": h[2].content_hash,
+            })
             for h in hits[:top_k]
         ]
 
@@ -150,22 +165,19 @@ class VectorStore:
 class FactTable:
     """
     Extracts numerical/financial facts from LDUs into a SQLite table.
-    Schema: doc_id, ldu_id, field_name, value, unit, page, content_hash
+    Schema: doc_id, ldu_id, field_name, value, unit, page, content_hash, source_path
     """
 
-    # Patterns to extract key-value facts
     FACT_PATTERNS = [
-        # "Revenue: $4.2B" or "Revenue: 4,200,000"
         re.compile(
             r"(?P<field>[A-Za-z][A-Za-z\s\-/]{2,40})"
             r"\s*[:=]\s*"
-            r"(?P<value>[\$£€]?[\d,\.]+\s*(?:million|billion|thousand|B|M|K|%)?)",
+            r"(?P<value>[\$\xa3\u20ac]?[\d,\.]+\s*(?:million|billion|thousand|B|M|K|%)?)",
             re.IGNORECASE,
         ),
-        # "Q3 2024: $4.2B"
         re.compile(
             r"(?P<field>[A-Za-z0-9][A-Za-z0-9\s\-/]{1,30})"
-            r"\s+(?P<value>[\$£€][\d,\.]+\s*(?:million|billion|B|M|K)?)",
+            r"\s+(?P<value>[\$\xa3\u20ac][\d,\.]+\s*(?:million|billion|B|M|K)?)",
             re.IGNORECASE,
         ),
     ]
@@ -192,37 +204,34 @@ class FactTable:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_id ON facts(doc_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_field ON facts(field_name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_field  ON facts(field_name)")
             conn.commit()
 
     def extract_and_store(self, ldus: List[LDU], source_path: str = "") -> int:
         """Parse facts from LDUs and store in SQLite. Returns count inserted."""
         rows: List[tuple] = []
-        doc_id = ldus[0].doc_id if ldus else "unknown"
-
         for ldu in ldus:
             page = ldu.page_refs[0] if ldu.page_refs else None
             for pattern in self.FACT_PATTERNS:
                 for m in pattern.finditer(ldu.content or ""):
                     field_name = m.group("field").strip().rstrip(":").strip()
-                    value_raw = m.group("value").strip()
-                    # Extract unit
+                    value_raw  = m.group("value").strip()
                     unit = None
                     for u in ["million", "billion", "thousand", "B", "M", "K", "%", "$", "£", "€"]:
                         if u.lower() in value_raw.lower():
                             unit = u
                             break
-                    if len(field_name) < 3 or len(value_raw) < 1:
+                    if len(field_name) < 3 or not value_raw:
                         continue
                     rows.append((
                         ldu.doc_id, ldu.ldu_id, field_name, value_raw,
                         unit, page, ldu.content_hash, source_path,
                     ))
-
         if rows:
             with sqlite3.connect(self.db_path) as conn:
                 conn.executemany(
-                    "INSERT INTO facts (doc_id, ldu_id, field_name, value, unit, page, content_hash, source_path) "
+                    "INSERT INTO facts "
+                    "(doc_id, ldu_id, field_name, value, unit, page, content_hash, source_path) "
                     "VALUES (?,?,?,?,?,?,?,?)",
                     rows,
                 )
@@ -230,7 +239,7 @@ class FactTable:
         return len(rows)
 
     def query(self, field_name: str, doc_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Query facts by field name (fuzzy match)."""
+        """Query facts by field name (fuzzy LIKE match)."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             if doc_id:
@@ -252,16 +261,14 @@ class FactTable:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                rows = conn.execute(sql).fetchall()
-                return [dict(r) for r in rows]
+                return [dict(r) for r in conn.execute(sql).fetchall()]
         except Exception as e:
             return [{"error": str(e)}]
 
 
-# ── PageIndex navigator ───────────────────────────────────────────────────────
+# ── PageIndex section search ──────────────────────────────────────────────────
 
 def _section_matches(node: SectionNode, topic: str) -> float:
-    """Score a section node against a topic query."""
     topic_l = topic.lower()
     score = 0.0
     title_l = node.title.lower()
@@ -275,7 +282,6 @@ def _section_matches(node: SectionNode, topic: str) -> float:
 
 
 def _find_sections(nodes: List[SectionNode], topic: str, top_k: int = 3) -> List[Dict[str, Any]]:
-    """Recursively search section tree, return top_k matches."""
     hits: List[Tuple[float, SectionNode]] = []
 
     def recurse(node: SectionNode) -> None:
@@ -312,7 +318,7 @@ def _find_sections(nodes: List[SectionNode], topic: str, top_k: int = 3) -> List
 class AuditResult:
     claim: str
     verdict: str          # "verified" | "not_found" | "unverifiable"
-    confidence: float     # 0.0 – 1.0
+    confidence: float     # 0.0 - 1.0
     evidence: List[Dict[str, Any]] = field(default_factory=list)
     explanation: str = ""
 
@@ -332,40 +338,29 @@ class QueryAgent:
         vector_store: Optional[VectorStore] = None,
         source_path: str = "",
     ) -> None:
-        self.page_index = page_index
-        self.ldus = ldus
+        self.page_index  = page_index
+        self.ldus        = ldus
         self.source_path = source_path or page_index.source_path
         self._ldu_map: Dict[str, LDU] = {ldu.ldu_id: ldu for ldu in ldus}
 
-        # Vector store
         self.vector_store = vector_store or VectorStore()
         if ldus:
             self.vector_store.ingest(ldus, self.source_path)
 
-        # FactTable
         self.fact_table = fact_table or FactTable()
         if ldus:
             self.fact_table.extract_and_store(ldus, self.source_path)
 
-    # ── Tool 1: pageindex_navigate ────────────────────────────────────────────
+    # ── Tool 1 ────────────────────────────────────────────────────────────────
 
     def pageindex_navigate(self, topic: str, page: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Navigate the PageIndex.
-        If `page` is given, return the flat page-level index for that page.
-        If `topic` is given, search the hierarchical section tree.
-        """
+        """Navigate the PageIndex by page number or topic string."""
         if page is not None:
             for node in self.page_index.root:
                 if node.page == page:
-                    return {
-                        "tool": "pageindex_navigate",
-                        "page": page,
-                        "items": node.model_dump(),
-                    }
+                    return {"tool": "pageindex_navigate", "page": page, "items": node.model_dump()}
             return {"tool": "pageindex_navigate", "page": page, "items": [], "message": "page not found"}
 
-        # Section tree traversal
         matches = _find_sections(self.page_index.sections, topic, top_k=3)
         return {
             "tool": "pageindex_navigate",
@@ -374,27 +369,23 @@ class QueryAgent:
             "results": matches,
         }
 
-    # ── Tool 2: semantic_search ───────────────────────────────────────────────
+    # ── Tool 2 ────────────────────────────────────────────────────────────────
 
     def semantic_search(self, query: str, top_k: int = 5) -> Dict[str, Any]:
-        """
-        Search LDUs using vector similarity (ChromaDB) or keyword fallback.
-        Returns results with ProvenanceChain for each hit.
-        """
+        """Search LDUs via vector similarity. Returns results with ProvenanceChain."""
         hits = self.vector_store.search(query, top_k)
         results = []
         for ldu_id, score, meta in hits:
             ldu = self._ldu_map.get(ldu_id)
             if ldu is None:
                 continue
-            provenance = _build_provenance(ldu, self.source_path)
             results.append({
                 "ldu_id": ldu_id,
                 "score": round(score, 4),
                 "chunk_type": ldu.chunk_type,
                 "snippet": (ldu.content or "")[:300],
                 "page_refs": ldu.page_refs,
-                "provenance": provenance,
+                "provenance": _build_provenance(ldu, self.source_path),
             })
         return {
             "tool": "semantic_search",
@@ -403,32 +394,23 @@ class QueryAgent:
             "results": results,
         }
 
-    # ── Tool 3: structured_query ──────────────────────────────────────────────
+    # ── Tool 3 ────────────────────────────────────────────────────────────────
 
-    def structured_query(self, field_name: str, doc_id: Optional[str] = None,
-                         raw_sql: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Query the SQLite FactTable by field name or raw SQL.
-        Returns results with provenance (ldu_id, page, content_hash).
-        """
-        if raw_sql:
-            rows = self.fact_table.query_sql(raw_sql)
-        else:
-            rows = self.fact_table.query(field_name, doc_id)
-
-        # Enrich with LDU provenance
+    def structured_query(
+        self,
+        field_name: str,
+        doc_id: Optional[str] = None,
+        raw_sql: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Query SQLite FactTable by field name or raw SQL."""
+        rows = self.fact_table.query_sql(raw_sql) if raw_sql else self.fact_table.query(field_name, doc_id)
         for row in rows:
-            ldu_id = row.get("ldu_id", "")
-            ldu = self._ldu_map.get(ldu_id)
-            if ldu:
-                row["provenance"] = _build_provenance(ldu, self.source_path)
-            else:
-                row["provenance"] = {
-                    "document_name": Path(self.source_path).name,
-                    "page": row.get("page"),
-                    "content_hash": row.get("content_hash", ""),
-                }
-
+            ldu = self._ldu_map.get(row.get("ldu_id", ""))
+            row["provenance"] = _build_provenance(ldu, self.source_path) if ldu else {
+                "document_name": Path(self.source_path).name,
+                "page": row.get("page"),
+                "content_hash": row.get("content_hash", ""),
+            }
         return {
             "tool": "structured_query",
             "field_name": field_name,
@@ -440,33 +422,25 @@ class QueryAgent:
 
     def ask(self, question: str, top_k: int = 5) -> Dict[str, Any]:
         """
-        Main entry point: routes question through all three tools and synthesises an answer.
+        Main entry point: routes through all three tools and synthesises answer.
         Always returns a ProvenanceChain in the response.
         """
-        # 1. PageIndex navigation first
-        nav = self.pageindex_navigate(topic=question)
-
-        # 2. Semantic search
+        nav    = self.pageindex_navigate(topic=question)
         search = self.semantic_search(question, top_k)
 
-        # 3. Structured query for number-heavy questions
         structured: Optional[Dict] = None
-        number_keywords = re.findall(r"\b(?:revenue|profit|loss|expenditure|total|amount|cost|"
-                                     r"budget|income|tax|rate|ratio|value|year|quarter|q\d)\b",
-                                     question, re.I)
+        number_keywords = re.findall(
+            r"\b(?:revenue|profit|loss|expenditure|total|amount|cost|"
+            r"budget|income|tax|rate|ratio|value|year|quarter|q\d)\b",
+            question, re.I,
+        )
         if number_keywords:
             structured = self.structured_query(number_keywords[0])
 
-        # Compile answer
-        top_results = search.get("results", [])
+        top_results  = search.get("results", [])
         top_sections = nav.get("results", [])
-
-        answer_parts = []
-        all_provenance = []
-
-        for r in top_results[:3]:
-            answer_parts.append(r["snippet"])
-            all_provenance.append(r["provenance"])
+        answer_parts   = [r["snippet"] for r in top_results[:3]]
+        all_provenance = [r["provenance"] for r in top_results[:3]]
 
         return {
             "question": question,
@@ -482,10 +456,17 @@ class QueryAgent:
 
     def verify_claim(self, claim: str) -> AuditResult:
         """
-        Audit Mode: verify whether a claim is supported by the document corpus.
-        Returns AuditResult with verdict: 'verified', 'not_found', or 'unverifiable'.
+        Verify whether a claim is supported by the document corpus.
+
+        Two-step approach (FIX for keyword-only limitation):
+          Step 1: semantic retrieval finds best candidate evidence chunks
+          Step 2: LLM confirmation if OPENROUTER_API_KEY is set.
+                  Handles paraphrased claims that overlap scoring misses.
+                  Falls back to overlap-only when no API key.
+
+        Returns AuditResult with verdict: 'verified' | 'not_found' | 'unverifiable'
         """
-        search = self.semantic_search(claim, top_k=8)
+        search  = self.semantic_search(claim, top_k=8)
         results = search.get("results", [])
 
         if not results:
@@ -496,7 +477,7 @@ class QueryAgent:
                 explanation="No matching content found in document corpus.",
             )
 
-        # Score evidence relevance
+        # ── Step 1: keyword overlap scoring ──────────────────────────────────
         claim_words = set(re.findall(r"\b\w{4,}\b", claim.lower()))
         scored = []
         for r in results:
@@ -507,22 +488,47 @@ class QueryAgent:
         scored.sort(key=lambda x: x[0], reverse=True)
         best_score, best_result = scored[0]
 
-        if best_score >= 0.5:
-            verdict = "verified"
-        elif best_score >= 0.2:
-            verdict = "unverifiable"
+        # ── Step 2: LLM confirmation (handles paraphrasing) ───────────────────
+        llm_verdict: Optional[str] = None
+        if best_score >= 0.15 and os.getenv("OPENROUTER_API_KEY"):
+            prompt = (
+                f"You are a document auditor.\n\n"
+                f"Claim: {claim}\n\n"
+                f"Evidence from document:\n{best_result.get('snippet', '')[:600]}\n\n"
+                f"Does the evidence directly support the claim?\n"
+                f"Respond with exactly one word: SUPPORTED, PARTIAL, or NOT_SUPPORTED"
+            )
+            raw = _call_openrouter(prompt, max_tokens=10).upper()
+            if "SUPPORTED" in raw and "NOT" not in raw:
+                llm_verdict = "verified"
+            elif "PARTIAL" in raw:
+                llm_verdict = "unverifiable"
+            elif "NOT_SUPPORTED" in raw:
+                llm_verdict = "not_found"
+
+        # ── Final verdict ─────────────────────────────────────────────────────
+        if llm_verdict:
+            verdict    = llm_verdict
+            confidence = round(min(1.0, best_score + 0.2), 3) if llm_verdict == "verified" else round(best_score, 3)
         else:
-            verdict = "not_found"
+            if best_score >= 0.5:
+                verdict = "verified"
+            elif best_score >= 0.2:
+                verdict = "unverifiable"
+            else:
+                verdict = "not_found"
+            confidence = round(best_score, 3)
 
         explanation = (
-            f"Best matching content (overlap={best_score:.2f}): "
-            f"'{(best_result.get('snippet') or '')[:200]}'"
+            f"Best match (overlap={best_score:.2f}"
+            + (f", llm={llm_verdict}" if llm_verdict else "")
+            + f"): '{(best_result.get('snippet') or '')[:200]}'"
         )
 
         return AuditResult(
             claim=claim,
             verdict=verdict,
-            confidence=round(best_score, 3),
+            confidence=min(1.0, confidence),
             evidence=[best_result.get("provenance", {})] if best_score > 0.1 else [],
             explanation=explanation,
         )
