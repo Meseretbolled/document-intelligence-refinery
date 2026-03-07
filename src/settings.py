@@ -35,5 +35,6 @@ class Settings(BaseSettings):
 # ✅ This is what src/main.py expects to import
 settings = Settings()
 
-# Load .env if it exists (optional)
-load_dotenv()
+# Load .env from project root explicitly — works regardless of CWD.
+_env_file = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=True)

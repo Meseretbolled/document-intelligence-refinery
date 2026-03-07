@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# Load .env before anything else — Streamlit doesn't use src/main.py entry point
+from dotenv import load_dotenv
+from pathlib import Path as _Path
+load_dotenv(dotenv_path=_Path(__file__).resolve().parent / ".env", override=True)
+
 import json
 import time
 from pathlib import Path

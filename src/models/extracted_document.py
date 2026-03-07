@@ -11,7 +11,7 @@ class ExtractedBlock(BaseModel):
     """
     A single unit of extracted content.
     """
-    block_type: Literal["text", "table", "figure", "header", "footer"]
+    block_type: Literal["text", "table", "figure", "header", "footer", "list", "section_header", "caption"]
     text: Optional[str] = None
     html: Optional[str] = None
     provenance: Optional[ProvenanceChain] = None

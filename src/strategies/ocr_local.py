@@ -58,7 +58,7 @@ class LocalOCRExtractor(BaseExtractor):
                     strategy_used="C",
                     confidence=0.0,
                     blocks=[],
-                    metadata={"strategy_c_level": "C1"},
+                    meta={"strategy_c_level": "C1"},
                 ),
                 "C1 failed: source file not found",
             )
@@ -98,7 +98,7 @@ class LocalOCRExtractor(BaseExtractor):
                     strategy_used="C",
                     confidence=conf,
                     blocks=blocks,
-                    metadata={
+                    meta={
                         "strategy_c_level": "C1",
                         "page_count": doc.page_count,
                         "needs_review": conf < 0.60,
@@ -115,7 +115,7 @@ class LocalOCRExtractor(BaseExtractor):
                     strategy_used="C",
                     confidence=0.0,
                     blocks=[],
-                    metadata={"strategy_c_level": "C1"},
+                    meta={"strategy_c_level": "C1"},
                 ),
                 f"C1 failed: {type(e).__name__}: {e}",
             )

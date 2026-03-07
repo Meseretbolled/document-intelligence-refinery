@@ -127,6 +127,66 @@ _LANG_PROBE_PROMPT = (
 )
 
 
+def _parse_lang_response(raw: str) -> Optional[str]:
+    """
+    Robustly extract a language code from any VLM response format.
+
+    Handles: clean JSON, fenced JSON, prose ("The language is Amharic"),
+    key-value ("Language: Amharic"), bare code ("am"), Ethiopic chars in text.
+
+    This is the reason language detection was returning None even with
+    OPENROUTER_API_KEY set: json.loads() was throwing on prose responses,
+    the exception was silently caught, and all models were skipped.
+    """
+    import re as _re
+    if not raw:
+        return None
+
+    # 1. Try JSON parse — strip fences first
+    clean = _re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=_re.IGNORECASE)
+    clean = _re.sub(r"\s*```$", "", clean).strip()
+    try:
+        obj = json.loads(clean)
+        if isinstance(obj, dict):
+            lang = str(obj.get("language") or "").strip().lower()
+            if lang:
+                return lang
+    except Exception:
+        pass
+
+    # 2. JSON fragment anywhere in the text
+    m = _re.search(r'\{[^}]*"language"\s*:\s*"([^"]+)"[^}]*\}', raw, _re.IGNORECASE)
+    if m:
+        return m.group(1).strip().lower()
+
+    # 3. Prose / keyword detection
+    lower = raw.lower()
+    if any(w in lower for w in ["amharic", "ethiopic", "ge'ez", "geez", "\u12a0\u121d\u1203\u122d\u129b"]):
+        return "am"
+    if any(w in lower for w in ["tigrinya", "tigri"]):
+        return "am"
+    if "mixed" in lower and any(w in lower for w in ["amharic", "english", "ethiopic"]):
+        return "mixed"
+    if any(w in lower for w in ["english", "latin script"]):
+        return "en"
+
+    # 4. Check for Ethiopic Unicode characters in the raw response itself
+    if any("\u1200" <= c <= "\u137f" for c in raw):
+        return "am"
+
+    # 5. Bare language code on its own line
+    for line in raw.strip().splitlines():
+        stripped = line.strip().lower().strip(".,;:")
+        if stripped in ("am", "amharic", "ethiopic"):
+            return "am"
+        if stripped in ("en", "english"):
+            return "en"
+        if stripped == "mixed":
+            return "mixed"
+
+    return None
+
+
 def _detect_language_from_image(pdf_path: str) -> tuple[Optional[str], float]:
     """
     Detect language of a scanned PDF by sending page 1 image to the VLM.
@@ -147,7 +207,7 @@ def _detect_language_from_image(pdf_path: str) -> tuple[Optional[str], float]:
     if not img_b64:
         return None, 0.0
 
-    base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    base_url = os.getenv("OPENROUTER_URL", os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
     headers  = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type":  "application/json",
@@ -176,18 +236,16 @@ def _detect_language_from_image(pdf_path: str) -> tuple[Optional[str], float]:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode())
             raw = (data["choices"][0]["message"]["content"] or "").strip()
+            print(f"  [triage-lang] model={model} raw response: {raw[:120]!r}")
 
-            # Parse response — expecting {"language": "am"} or similar
-            # Be robust: strip markdown fences if model added them
-            raw_clean = raw.strip("`").strip()
-            if raw_clean.startswith("json"):
-                raw_clean = raw_clean[4:].strip()
-            parsed = json.loads(raw_clean)
-            lang = str(parsed.get("language") or "").strip().lower()
+            # Parse response — VLMs return many formats: JSON, prose, bare code.
+            # Use a multi-strategy parser so any format succeeds.
+            lang = _parse_lang_response(raw)
+            print(f"  [triage-lang] parsed lang={lang!r}")
 
             if lang in ("am", "amharic", "ethiopic", "tigrinya", "ti"):
                 return "am", 0.90
-            if lang in ("mixed",):
+            if lang == "mixed":
                 return "mixed", 0.85
             if lang in ("en", "english"):
                 return "en", 0.85
@@ -195,15 +253,21 @@ def _detect_language_from_image(pdf_path: str) -> tuple[Optional[str], float]:
                 return lang, 0.75
 
         except urllib.error.HTTPError as e:
-            # Rate limited or model error — try next model
+            body = ""
+            try:
+                body = e.read().decode()[:300]
+            except Exception:
+                pass
+            print(f"  [triage-lang] model={model} HTTP {e.code}: {body}")
             if e.code in (429, 503, 529, 400, 404, 422):
                 continue
             break
-        except Exception:
-            # JSON parse error, timeout, etc. — try next model
+        except Exception as _ex:
+            print(f"  [triage-lang] model={model} error: {type(_ex).__name__}: {_ex}")
             continue
 
     # All models failed — return None safely
+    print(f"  [triage-lang] all models failed — language probe returning None")
     return None, 0.0
 
 
@@ -271,20 +335,29 @@ def triage_pdf(pdf_path: str, rules: dict) -> DocumentProfile:
     language, language_conf = _detect_language(text_sample)
 
     if language is None and is_scanned:
-        # ── FIX: scanned doc with no text layer ──────────────────────────────
-        # Send page 1 image to VLM for language identification.
-        # This ensures:
-        #   - Amharic scanned docs get language="am" -> router uses C3 fast-path
-        #   - English scanned docs get language="en" -> router uses C1->C2->C3
-        # Gracefully returns (None, 0.0) if no API key or VLM unavailable.
+        # ── Scanned doc with no text layer: probe language via VLM image ─────
+        # Sends page 1 as an image to the VLM with a tiny prompt (max_tokens=20).
+        # Requires OPENROUTER_API_KEY in .env — returns (None, 0.0) if not set.
         print(f"  [triage] scanned PDF, no text layer — probing language via VLM for {doc_id}")
         language, language_conf = _detect_language_from_image(pdf_path)
         if language:
             print(f"  [triage] detected language={language} (conf={language_conf:.2f}) from image")
         else:
-            print(f"  [triage] language probe inconclusive — set OPENROUTER_API_KEY to enable")
+            print(f"  [triage] language probe inconclusive — ensure OPENROUTER_API_KEY is set in .env")
 
     domain_hint = _detect_domain(text_sample)
+
+    # Fallback: infer domain from filename when text layer is empty (scanned docs)
+    if not domain_hint or domain_hint == "general":
+        fname_lower = doc_id.lower()
+        if any(k in fname_lower for k in ["budget", "expense", "expenditure", "revenue", "tax", "fiscal", "finance", "financial"]):
+            domain_hint = "financial"
+        elif any(k in fname_lower for k in ["audit", "auditor", "legal", "court", "proclamation"]):
+            domain_hint = "legal"
+        elif any(k in fname_lower for k in ["procurement", "tender", "contract"]):
+            domain_hint = "legal"
+        elif any(k in fname_lower for k in ["assessment", "survey", "report", "analysis"]):
+            domain_hint = "technical"
 
     # Cost tier
     if origin_type == "scanned_image":

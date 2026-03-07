@@ -518,6 +518,56 @@ HTTP 429 received from current model
 
 ---
 
+---
+
+## LLM Strategy: OpenRouter Free Tier vs Ollama vs Claude API
+
+### Recommendation for this project
+
+**Use OpenRouter free tier.** Here is a direct comparison:
+
+| Option | Cost | Amharic support | Setup | Best model available |
+|---|---|---|---|---|
+| **OpenRouter free** | **$0.00** | **Yes — qwen3-vl-235b** | API key only | qwen3-vl-235b-thinking:free |
+| Ollama (local) | Free, GPU required | Limited | 235B model needs 140GB RAM | qwen3-vl-235b (if you have H100s) |
+| Claude API | ~$0.015/image | Excellent | API key | claude-opus-4-6 |
+
+### Why OpenRouter free tier is the right choice
+
+The `qwen/qwen3-vl-235b-thinking:free` model on OpenRouter is the same model that runs on Ollama — the difference is that OpenRouter runs it on their infrastructure at no cost to you. For this project:
+
+- **You do not need a GPU** — OpenRouter's servers handle it
+- **Amharic/Ethiopic script is supported** — Qwen3-VL was trained on 32 languages including multilingual document OCR
+- **Rate limits are generous** — ~20 req/min, ~200 req/day per model; the pipeline falls back to the next model automatically
+- **Cost is $0.00** — the budget guard in `extraction_rules.yaml` is already set to `0.00`
+
+### Why NOT Ollama for this project
+
+Running `qwen3-vl:235b-instruct` locally requires **~140GB of GPU VRAM** (or extremely slow CPU inference). Unless you have access to a multi-GPU server, local Ollama is not practical for the 235B model. The smaller `qwen3-vl:30b` variant fits in ~20GB and gives reasonable Amharic results, but OpenRouter gives you the 235B for free.
+
+### Why NOT Claude API directly
+
+Claude does not expose an image-based OCR API designed for bulk document extraction. Claude API calls cost ~$15 per 1,000 pages at Opus pricing. OpenRouter free tier is the correct choice for this pipeline.
+
+### How to configure
+
+```bash
+# .env — just set this, everything else is pre-configured
+OPENROUTER_API_KEY=sk-or-your-key-here
+
+# Free models used automatically (in order of preference for Amharic):
+# 1. qwen/qwen3-vl-235b-thinking:free    <- Best for Ethiopic script
+# 2. google/gemma-3-27b-it:free          <- 140+ languages
+# 3. qwen/qwen3-vl-30b-a3b-thinking:free <- Strong multilingual fallback
+# 4. meta-llama/llama-4-maverick:free    <- Broad multilingual
+# 5. openrouter/auto:free                <- Safety net
+```
+
+### Optional: Use Ollama for Strategy B (Docling) only
+
+If you want fully offline extraction for native digital PDFs (no API key needed), Docling (Strategy B) runs entirely locally using CPU/GPU. For scanned PDFs and Amharic documents, OpenRouter remains the recommended path.
+
+
 ## Amharic and Ethiopic Script Support
 
 This pipeline has first-class support for Amharic documents — a capability that most document intelligence tools lack entirely because they depend on Tesseract, which cannot handle Ethiopic script without a separately installed language pack.
@@ -677,11 +727,17 @@ Open **http://localhost:8501**, upload any PDF, and click **Run Refinery**.
 ### 5. Run via command line
 
 ```bash
-# Process a single document
-python -m src.main process data/raw/my_document.pdf
+# Process a single document (full 5-stage pipeline)
+python -m src.main run --input-path my_document.pdf
 
-# Process all documents in a directory
-python -m src.main process data/raw/ --limit 10
+# Process all PDFs in a directory
+python -m src.main run --input-path ./docs/ --limit 10
+
+# Ask a question against a processed document
+python -m src.main query --pdf-path my_document.pdf --question "What is the total revenue?"
+
+# Audit / verify a claim
+python -m src.main audit --pdf-path my_document.pdf --claim "Revenue was $4.2B in Q3"
 ```
 
 ### 6. Run with Docker
@@ -825,6 +881,172 @@ pytest tests/test_chunker.py -v
 | `test_chunker.py` | R1: table never merged; R2: caption absorbed into figure; R3: list preserved as one unit; R4: headers propagate to children; R5: cross-references stored; validator detects violations; all content preserved |
 
 ---
+
+---
+
+## Testing & Verification — Run Everything
+
+This section contains the exact commands to verify every system component. Run in order after installation.
+
+### Step 0: Installation
+
+```bash
+# Install core + dev dependencies
+pip install -e ".[dev]"
+
+# Optional: install Docling for Strategy B (layout-aware extraction)
+pip install -e ".[docling]"
+
+# Verify imports
+python -c "
+from src.agents.triage import triage_pdf
+from src.agents.chunker import SemanticChunkingEngine, ChunkValidator
+from src.agents.indexer import build_page_index
+from src.agents.query_agent import QueryAgent, VectorStore, FactTable
+print('All imports OK')
+"
+```
+
+### Step 1: Unit tests (no PDF needed)
+
+```bash
+# Full test suite — all should pass
+pytest tests/ -v
+
+# Individual suites
+pytest tests/test_triage.py -v        # Stage 1 classification
+pytest tests/test_confidence.py -v    # Confidence scoring logic
+pytest tests/test_router.py -v        # Escalation routing (A->B->C)
+pytest tests/test_chunker.py -v       # All 5 chunking rules (R1-R5)
+```
+
+### Step 2: Run full pipeline on a PDF
+
+```bash
+# Process one document
+python -m src.main run --input-path path/to/your.pdf
+
+# Process entire folder
+python -m src.main run --input-path ./docs/ --limit 10
+```
+
+**Artifacts written:**
+```
+.refinery/profiles/{doc_id}.json        <- DocumentProfile (Stage 1)
+.refinery/extracted/{doc_id}.json       <- ExtractedDocument (Stage 2)
+.refinery/ldu/{doc_id}.json             <- LDU list with chunking rules (Stage 3)
+.refinery/pageindex/{doc_id}.json       <- Hierarchical section tree (Stage 4)
+.refinery/qa/{doc_id}.json              <- Q&A pairs with provenance (Stage 5)
+.refinery/chroma/                        <- ChromaDB vector store
+.refinery/facts.db                       <- SQLite FactTable
+.refinery/extraction_ledger.jsonl        <- Audit trail (append-only)
+```
+
+### Step 3: Verify DocumentProfile (Stage 1)
+
+```bash
+cat .refinery/profiles/<doc_id>.json | python -m json.tool
+# Expect: origin_type, layout_complexity, language, domain_hint, cost_tier
+```
+
+### Step 4: Verify table extraction (Stage 2)
+
+```bash
+python -c "
+import json
+from pathlib import Path
+f = sorted(Path('.refinery/extracted').glob('*.json'))[0]
+d = json.loads(f.read_text())
+tables = [b for b in d['blocks'] if b['block_type'] == 'table']
+print(f'Strategy: {d["strategy_used"]}  Confidence: {d["confidence"]:.2f}')
+print(f'Blocks: {len(d["blocks"])}  Tables: {len(tables)}')
+if tables: print('Sample table:', tables[0]['text'][:300])
+"
+```
+
+### Step 5: Verify chunking rules (Stage 3)
+
+```bash
+python -c "
+import json
+from pathlib import Path
+from src.agents.chunker import ChunkValidator
+from src.models.ldu import LDU
+f = sorted(Path('.refinery/ldu').glob('*.json'))[0]
+ldus = [LDU(**l) for l in json.loads(f.read_text())]
+violations = ChunkValidator().validate(ldus)
+types = {}
+for ldu in ldus:
+    types[ldu.chunk_type] = types.get(ldu.chunk_type, 0) + 1
+print(f'LDUs: {len(ldus)}  Types: {types}')
+print(f'Rule violations: {len(violations)}')
+for v in violations[:3]: print(f'  - {v}')
+if not violations: print('All 5 chunking rules satisfied.')
+"
+```
+
+### Step 6: Verify PageIndex tree (Stage 4)
+
+```bash
+python -c "
+import json
+from pathlib import Path
+f = sorted(Path('.refinery/pageindex').glob('*.json'))[0]
+pi = json.loads(f.read_text())
+print(f'Pages: {pi["page_count"]}  Sections: {len(pi["sections"])}')
+for s in pi['sections'][:5]:
+    print(f'  [{s["level"]}] {s["title"][:60]} pp.{s["page_start"]}-{s["page_end"]}')
+    if s.get("summary"): print(f'      {s["summary"][:100]}')
+"
+```
+
+### Step 7: Query with Provenance (Stage 5)
+
+```bash
+# Natural language query with full ProvenanceChain
+python -m src.main query   --pdf-path path/to/your.pdf   --question "What is the total revenue reported?"
+
+# Claim verification (Audit Mode)
+python -m src.main audit   --pdf-path path/to/your.pdf   --claim "The document reports revenue over 10 billion"
+```
+
+### Step 8: Test Strategy C (Vision VLM) — scanned or Amharic docs
+
+```bash
+# Set API key first
+export OPENROUTER_API_KEY=sk-or-your-key-here
+
+# Run on a scanned PDF (will auto-route to Strategy C)
+python -m src.main run --input-path path/to/scanned.pdf
+
+# Verify VLM was used and cost was $0.00
+tail -1 .refinery/extraction_ledger.jsonl | python -m json.tool
+# Expect: "strategy_used": "C", "cost_estimate_usd": 0.0
+```
+
+### Step 9: Process all 4 corpus documents
+
+```bash
+# Place all 4 corpus PDFs in docs/ then:
+python -m src.main run --input-path ./docs/
+
+# Summary report of all runs
+cat .refinery/extraction_ledger.jsonl | python -c "
+import json, sys
+for line in sys.stdin:
+    o = json.loads(line)
+    print(f'{o["doc_id"][:38]:38}  strategy={o["strategy_used"]}  conf={o.get("confidence",0):.2f}  cost=\${o.get("cost_estimate_usd",0):.3f}')
+"
+```
+
+### Step 10: Launch Streamlit UI
+
+```bash
+streamlit run app.py
+# Open http://localhost:8501
+# Upload PDF → Run Refinery → inspect all 4 tabs: Profile, Extraction, PageIndex, Query
+```
+
 
 ## Demo Protocol
 
