@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     refinery_dir: Path = Path(".refinery")
     profiles_dir: Path = refinery_dir / "profiles"
     extracted_dir: Path = refinery_dir / "extracted"
+    ldu_dir: Path = refinery_dir / "ldu"
+    pageindex_dir: Path = refinery_dir / "pageindex"
+    chroma_dir: Path = refinery_dir / "chroma"
+    facts_db_path: Path = refinery_dir / "facts.db"
     ledger_path: Path = refinery_dir / "extraction_ledger.jsonl"
 
     def load_rules(self) -> Dict[str, Any]:

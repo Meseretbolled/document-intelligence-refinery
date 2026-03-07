@@ -1,21 +1,60 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Document Intelligence Refinery — Extraction Rules & Thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+
 triage:
   scanned_image_threshold:
     image_area_ratio_gte: 0.55
     text_chars_per_page_lte: 300
 
 confidence:
-  strategy_a_min_confidence: 0.6
-  strategy_b_min_confidence: 0.7
+  strategy_a_min_confidence: 0.60
+  strategy_b_min_confidence: 0.70
 
 escalation:
   allow_a_to_b: true
   allow_b_to_c: true
   max_attempts: 2
 
+# ── Vision model (Strategy C3) — FREE tier only, $0.00 cost ──────────────────
+# All models below end in :free — no credits needed, no billing.
+# Rate limit: ~20 req/min, ~200 req/day per model.
+# When one hits its limit, the pipeline automatically tries the next.
+#
+# Override at runtime: OPENROUTER_MODEL_CHAIN="model1,model2,model3"
+vlm:
+  # Standard document chain (best OCR first)
+  model_chain:
+    - qwen/qwen3-vl-235b-thinking:free      # Best: OCR specialist, 32 languages, 262K ctx
+    - qwen/qwen3-vl-30b-a3b-thinking:free   # Good: free, 131K ctx, strong vision
+    - nvidia/nemotron-nano-12b-vl:free       # Trained on OCRBench + DocVQA
+    - meta-llama/llama-4-maverick:free       # Fallback: large multimodal
+    - google/gemma-3-27b-it:free            # Fallback: 140+ languages
+    - openrouter/auto:free                   # Safety net: OpenRouter picks best available
+
+  # For Amharic/Ethiopic script (language=am or mixed)
+  amharic_model_chain:
+    - qwen/qwen3-vl-235b-thinking:free      # Best multilingual OCR
+    - google/gemma-3-27b-it:free            # Explicitly supports 140+ languages
+    - qwen/qwen3-vl-30b-a3b-thinking:free   # Strong multilingual fallback
+    - meta-llama/llama-4-maverick:free       # Broad multilingual
+    - openrouter/auto:free                   # Safety net
+
+  max_pages_per_doc: 6
+  retry_max_attempts: 3         # retries per model on 429 before trying next
+  retry_backoff_s: [2, 4, 8]   # exponential backoff delays in seconds
+
+# ── Budget ────────────────────────────────────────────────────────────────────
+# Strategy C is $0.00 (free models only).
+# Budgets still enforced for A/B to prevent runaway compute.
+budget:
+  default_batch_budget_usd: 0.00    # free — no spend cap needed
+  default_doc_budget_usd: 0.00
+
 cost_estimates_usd:
-  strategy_a: 0.001
-  strategy_b: 0.01
-  strategy_c: 0.10
+  strategy_a: 0.001       # pdfplumber/pymupdf — near zero compute
+  strategy_b: 0.010       # Docling/MinerU — local compute only
+  strategy_c: 0.000       # OpenRouter free tier — $0.00
 
 chunking:
   max_chars: 1200

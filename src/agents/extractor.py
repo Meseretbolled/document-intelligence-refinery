@@ -158,7 +158,7 @@ class ExtractionRouter:
             return b_doc, f"Skipped Strategy C due to budget: {decision.reason}"
 
         # 4) Strategy C layered execution: C1 -> C2 -> C3
-        c_doc, c_note = self.ex_c.extract(profile.doc_id, profile.source_path)
+        c_doc, c_note = self.ex_c.extract(profile.doc_id, profile.source_path, language=getattr(profile, 'language', None))
 
         strategy_c_level = (
             ((getattr(c_doc, "meta", {}) or {}).get("strategy_c_level"))
