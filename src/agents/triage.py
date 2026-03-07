@@ -378,15 +378,31 @@ def triage_pdf(pdf_path: str, rules: dict) -> DocumentProfile:
     language, language_conf = _detect_language(text_sample)
 
     if language is None and is_scanned:
-        # ── Scanned doc with no text layer: probe language via VLM image ─────
-        # Sends page 1 as an image to the VLM with a tiny prompt (max_tokens=20).
-        # Requires OPENROUTER_API_KEY in .env — returns (None, 0.0) if not set.
-        print(f"  [triage] scanned PDF, no text layer — probing language via VLM for {doc_id}")
-        language, language_conf = _detect_language_from_image(pdf_path)
-        if language:
-            print(f"  [triage] detected language={language} (conf={language_conf:.2f}) from image")
+        # ── Step 1: filename heuristic for known Amharic document patterns ───
+        # Ethiopian government documents with E.C. dates (Ethiopian Calendar)
+        # are almost always in Amharic. Detect this before making any API call.
+        fname_lower = doc_id.lower()
+        _amharic_hints = [
+            "e.c-", "e.c_", "_e.c", "-e.c",   # Ethiopian Calendar suffix
+            "amharic", "amh_", "_amh",
+            "የ", "ብር", "ክፍያ",                   # Ethiopic words in filename
+        ]
+        _is_likely_amharic = any(h in fname_lower for h in _amharic_hints) or                              any("ሀ" <= c <= "፿" for c in doc_id)
+
+        if _is_likely_amharic:
+            language      = "am"
+            language_conf = 0.85
+            print(f"  [triage] filename heuristic → language=am (Ethiopian Calendar pattern detected)")
         else:
-            print(f"  [triage] language probe inconclusive — ensure OPENROUTER_API_KEY is set in .env")
+            # ── Step 2: VLM image probe for unknown scanned docs ──────────────
+            print(f"  [triage] scanned PDF, no text layer — probing language via VLM for {doc_id}")
+            language, language_conf = _detect_language_from_image(pdf_path)
+            if language:
+                print(f"  [triage] detected language={language} (conf={language_conf:.2f}) from image")
+            else:
+                print(f"  [triage] language probe inconclusive — defaulting to 'en'")
+                language      = "en"
+                language_conf = 0.40
 
     domain_hint = _detect_domain(text_sample)
 
