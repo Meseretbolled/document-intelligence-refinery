@@ -1,307 +1,211 @@
-# Document Intelligence Refinery
-
-**TRP1 – Week 3: Document Intelligence Pipeline**
-
-## Overview
-
-Document Intelligence Refinery is an adaptive document processing system that analyzes heterogeneous documents (PDF, DOCX, PPTX, XLSX, images) and dynamically selects the most suitable extraction strategy.
-
-The system uses a **triage agent**, routing logic, and multiple extraction strategies to balance **cost, speed, and extraction quality**.
-
-The pipeline generates structured artifacts and maintains a transparent **decision ledger** that records extraction strategies, confidence scores, processing time, and cost estimates.
-
----
-
-## System Architecture
-
-![Architecture](assets/architecture.png)
-
-The pipeline follows a staged architecture:
-
-### 1. Input Layer
-
-Documents are ingested from the dataset directory. Supported formats include:
-
-* PDF
-* DOCX
-* PPTX
-* XLSX
-* Images
-
-Example input path:
-
-```
-data/raw/
-```
-
----
-
-### 2. Triage Agent
-
-The **Triage Agent** analyzes each document and produces a `DocumentProfile`.
-
-It computes signals such as:
-
-* `origin_type` (native text vs scanned image)
-* `layout_complexity`
-* `avg_text_chars_per_page`
-* `avg_image_area_ratio`
-
-These signals determine the most suitable extraction strategy.
-
----
-
-### 3. Extraction Router
-
-The **Extraction Router** selects an extraction strategy based on triage signals and predefined rules from:
-
-```
-rubric/extraction_rules.yaml
-```
-
-Routing decisions also consider:
-
-* confidence thresholds
-* escalation policies
-* estimated extraction cost
-
----
-
-### 4. Extraction Strategies
-
-The system supports three extraction strategies.
-
-#### Strategy A — Fast Text Extraction
-
-Used for documents that contain native text.
-
-Tools:
-
-* `pdfplumber`
-* `PyMuPDF`
-
-Characteristics:
-
-* very fast
-* low cost
-* suitable for digital PDFs
-
----
-
-#### Strategy B — Layout-Aware Extraction
-
-Used for complex or scanned documents.
-
-Tools:
-
-* `Docling`
-* OCR via RapidOCR
-
-Capabilities:
-
-* layout analysis
-* OCR for scanned documents
-* improved reading order
-
-This is the **primary strategy used in the interim submission**.
-
----
-
-#### Strategy C — Vision / VLM Extraction
-
-Designed for difficult documents requiring visual understanding.
-
-Examples:
-
-* forms
-* diagrams
-* heavily scanned files
-
-This strategy is **budget-guarded** and reserved for advanced processing in the final submission.
-
----
-
-### 5. Normalization Layer
-
-All extraction outputs are normalized into a unified schema:
-
-```
-ExtractedDocument
-```
-
-The schema contains:
-
-* document id
-* extraction strategy used
-* confidence score
-* extracted blocks
-* provenance metadata
-
-This ensures consistent downstream processing regardless of extraction strategy.
-
----
-
-### 6. Artifact Generation
-
-The pipeline produces structured artifacts in the `.refinery` directory.
-
-```
-.refinery/
- ├── profiles/
- │   └── {doc_id}.json
- │
- ├── extracted/
- │   └── {doc_id}.json
- │
- └── extraction_ledger.jsonl
-```
-
-#### profiles/
-
-Contains triage results (`DocumentProfile`).
-
-#### extracted/
-
-Contains normalized extraction output (`ExtractedDocument`).
-
-#### extraction_ledger.jsonl
-
-An append-only ledger recording:
-
-* strategy used
-* confidence score
-* processing time
-* estimated cost
-* triage signals
-
-This provides full **traceability of extraction decisions**.
-
----
-
-## Example Ledger Entry
-
-```
-{
-  "doc_id": "2013-E.C-Procurement-information",
-  "strategy_used": "B",
-  "confidence": 0.75,
-  "cost_estimate_usd": 0.01,
-  "processing_time_s": 131.03,
-  "signals": {
-    "origin_type": "scanned_image",
-    "layout_complexity": "mixed",
-    "avg_text_chars_per_page": 0.0,
-    "avg_image_area_ratio": 1.0
-  }
-}
-```
-
----
-
-## Project Structure
-
-```
-document-intelligence-refinery/
-
-src/
- ├── agents/
- │   └── triage.py
- │
- ├── strategies/
- │   ├── fast_text.py
- │   ├── layout_docling.py
- │   └── vision_vlm.py
- │
- ├── models/
- │   ├── document_profile.py
- │   └── extracted_document.py
- │
- ├── router.py
- ├── settings.py
- └── main.py
-
-rubric/
- └── extraction_rules.yaml
-
-data/
- └── raw/
-
-.refinery/
- ├── profiles/
- ├── extracted/
- └── extraction_ledger.jsonl
-```
-
----
-
-## Running the Pipeline
-
-Activate the virtual environment:
-
-```
-source .venv/bin/activate
-```
-
-Run the pipeline:
-
-```
-refinery --input-path data/raw --limit 4
-```
-
-Example output:
-
-```
-Processing 4 PDF(s)...
-2013-E.C-Assigned-regular-budget-and-expense.pdf -> strategy B, confidence=0.75
-2013-E.C-Audit-finding-information.pdf -> strategy B, confidence=0.55
-2013-E.C-Procurement-information.pdf -> strategy B, confidence=0.75
-2018_Audited_Financial_Statement_Report.pdf -> strategy B, confidence=0.75
-```
-
-Artifacts will be generated in:
-
-```
-.refinery/
-```
-
----
-
-## Interim Implementation Scope
-
-The interim implementation includes:
-
-* document triage and profiling
-* strategy routing
-* Strategy A (text extraction)
-* Strategy B (layout-aware OCR extraction)
-* extraction normalization
-* decision ledger and artifact generation
-
----
-
-## Planned Improvements (Final Submission)
-
-Future enhancements will include:
-
-* Strategy C vision-based extraction using VLMs
-* improved OCR language handling
-* page-level provenance tracking
-* structured table extraction
-* enhanced confidence scoring
-
----
-
-## Key Design Goals
-
-* adaptive extraction strategy selection
-* transparent decision logging
-* cost-aware document processing
-* modular extraction architecture
-
----
-
-## Author
-
-Meseret Bolled
-Software Engineering Student
-Addis Ababa Science and Technology University
+📋 Table of Contents
+
+The Problem
+What This Builds
+System Architecture
+The 5 Pipeline Stages
+The Engineering Decisions
+Free VLM Strategy
+Amharic Support
+Project Structure
+Quick Start
+Configuration
+Artifact Outputs
+Running Tests
+Demo Protocol
+
+🔴 The Problem
+Every enterprise has its institutional memory locked in documents. Banks, hospitals, law firms — all face the same three failure modes:
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│  STRUCTURE COLLAPSE   Traditional OCR flattens two-column layouts,  │
+│                       breaks tables, drops headers. Text is present │
+│                       but semantically useless.                     │
+│                                                                     │
+│  CONTEXT POVERTY      Naive chunking severs logical units. A table  │
+│                       split across two chunks → hallucinated        │
+│                       answers on every query about that table.      │
+│                                                                     │
+│  PROVENANCE BLINDNESS "Where in the 400-page report does this       │
+│                       number come from?" Without spatial            │
+│                       provenance, extracted data can't be audited.  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+
+This pipeline solves all three.
+
+✅ What This Builds
+
+INPUT                                          OUTPUT
+─────────────────────────────────────────────────────────────────────
+PDFs (native digital)    ──┐               ┌─ Structured JSON schemas
+PDFs (scanned images)    ──┤               ├─ Hierarchical section tree
+Amharic / Ethiopic docs  ──┤   REFINERY    ├─ ChromaDB vector store
+Mixed layout reports     ──┤   PIPELINE    ├─ SQLite FactTable (numbers)
+Table-heavy fiscal data  ──┘               ├─ Provenance-tagged LDUs
+                                           └─ Audit trail with page+bbox
+
+
+  🏗 System Architecture                                         
+╔══════════════════════════════════════════════════════════════════════╗
+║                    DOCUMENT INTELLIGENCE REFINERY                    ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║   ┌──────────┐    ┌─────────────┐    ┌──────────────────────────┐   ║
+║   │  INPUT   │    │   STAGE 1   │    │        STAGE 2           │   ║
+║   │          │───▶│   TRIAGE    │───▶│    EXTRACTION ROUTER     │   ║
+║   │ Any PDF  │    │   AGENT     │    │                          │   ║
+║   └──────────┘    └─────────────┘    │  ┌────┐ ┌────┐ ┌────┐   │   ║
+║                         │            │  │ A  │ │ B  │ │ C  │   │   ║
+║                  DocumentProfile     │  │Fast│ │Lay-│ │VLM │   │   ║
+║                         │            │  │Text│ │out │ │Free│   │   ║
+║                    ┌────▼───────┐    │  └────┘ └────┘ └────┘   │   ║
+║                    │ origin?    │    │  conf≥0.6 conf≥0.7  ▲    │   ║
+║                    │ layout?    │    │     │       │    escalate│   ║
+║                    │ language?  │    └──────────────────────────┘   ║
+║                    │ cost_tier? │                 │                  ║
+║                    └────────────┘         ExtractedDocument          ║
+║                                                   │                  ║
+║   ┌────────────────────────────────────────────────▼───────────┐    ║
+║   │                        STAGE 3                              │    ║
+║   │               SEMANTIC CHUNKING ENGINE                      │    ║
+║   │                                                             │    ║
+║   │  R1: Tables always standalone (never split from header)     │    ║
+║   │  R2: Figure captions stored as parent figure metadata       │    ║
+║   │  R3: Lists kept as single LDU unless exceeds max_chars      │    ║
+║   │  R4: Section headers propagated to all child chunks         │    ║
+║   │  R5: Cross-references stored in provenance meta             │    ║
+║   │                          ▼ ChunkValidator                   │    ║
+║   └───────────────────── List[LDU] ─────────────────────────────┘    ║
+║                               │                                      ║
+║   ┌───────────────────────────▼────────────────────────────────┐    ║
+║   │                        STAGE 4                              │    ║
+║   │                  PAGEINDEX BUILDER                          │    ║
+║   │                                                             │    ║
+║   │   Flat page index          Hierarchical section tree        │    ║
+║   │   ┌──────────────┐         ┌─ Document                      │    ║
+║   │   │ page 1: [...] │         │  ├─ Chapter 1                  │    ║
+║   │   │ page 2: [...] │         │  │  ├─ Section 1.1             │    ║
+║   │   │ page N: [...] │         │  │  └─ Section 1.2             │    ║
+║   │   └──────────────┘         │  └─ Chapter 2                  │    ║
+║   │                            └── [summary + entities]         │    ║
+║   └─────────────────────────────────────────────────────────────┘    ║
+║                               │                                      ║
+║   ┌───────────────────────────▼────────────────────────────────┐    ║
+║   │                        STAGE 5                              │    ║
+║   │                   QUERY INTERFACE AGENT                     │    ║
+║   │                                                             │    ║
+║   │  Tool 1: pageindex_navigate(topic)  ── section tree search  │    ║
+║   │  Tool 2: semantic_search(query)     ── ChromaDB vectors     │    ║
+║   │  Tool 3: structured_query(field)    ── SQLite FactTable      │    ║
+║   │                    +                                         │    ║
+║   │  Audit Mode: verify_claim(claim) → verified/unverifiable    │    ║
+║   │                                                             │    ║
+║   │  Every answer: ProvenanceChain { doc, page, bbox, hash }    │    ║
+║   └─────────────────────────────────────────────────────────────┘    ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+🔄 The 5 Pipeline Stages
+Stage 1 — Triage Agent
+
+PDF arrives
+    │
+    ▼
+pdfplumber signals
+├── avg_text_chars_per_page  ──┐
+├── avg_image_area_ratio      ├──▶  origin_type
+└── font_metadata_present    ──┘    native_digital | scanned_image | mixed
+                                          │
+column heuristics ──────────────▶  layout_complexity
+table/figure bbox score             single_column | multi_column
+                                    table_heavy | figure_heavy
+                                          │
+Ethiopic Unicode range                    │
+U+1200–U+137F char count ──────▶  language  (am | en | mixed)
+                                          │
+                                          ▼
+                               ┌──────────────────────┐
+                               │    DocumentProfile    │
+                               │  + cost_tier          │
+                               │  + domain_hint        │
+                               └──────────────────────┘
+                               saved → .refinery/profiles/
+
+Stage 2 — Multi-Strategy Extraction Router
+
+DocumentProfile
+      │
+      ├─ cost_tier = fast_text_sufficient
+      │         └──▶ Strategy A (FastText)
+      │               pdfplumber + pymupdf
+      │               Confidence gate: ≥ 0.60
+      │               if FAIL ──────────────────────────┐
+      │                                                  │
+      ├─ cost_tier = needs_layout_model                  │
+      │    OR escalated from A ◀────────────────────────┘
+      │         └──▶ Strategy B (Layout-Aware)
+      │               Docling — tables as JSON
+      │               Reading order reconstruction
+      │               Confidence gate: ≥ 0.70
+      │               if FAIL ──────────────────────────┐
+      │                                                  │
+      └─ cost_tier = needs_vision_model                  │
+           OR language = am/mixed                        │
+           OR escalated from B ◀─────────────────────────┘
+                └──▶ Strategy C (Vision VLM) ← FREE
+                      Model fallback chain:
+                      1. qwen/qwen3-vl-235b:free  ← OCR specialist
+                      2. qwen/qwen3-vl-30b:free
+                      3. nvidia/nemotron-nano-12b-vl:free
+                      4. meta-llama/llama-4-maverick:free
+                      5. google/gemma-3-27b-it:free  ← 140+ languages
+                      6. openrouter/auto:free  ← safety net
+                      
+                      429 rate limit? → exponential backoff (2s→4s→8s)
+                                       → then try next model
+                      All models exhausted? → confidence=0.0 flagged
+
+Every run logged to .refinery/extraction_ledger.jsonl
+
+Stage 3 — Semantic Chunking Engine
+ExtractedDocument.blocks[]
+         │
+         ▼
+    ChunkingEngine                     5 Constitution Rules
+         │
+         ├─ chunk_type == "header"  ──▶  R4: Update current_section context
+         │                               Emit standalone. Stamp parent_section
+         │                               on ALL subsequent child LDUs.
+         │
+         ├─ chunk_type == "table"   ──▶  R1: Always standalone LDU.
+         │                               NEVER merged with surrounding text.
+         │                               Entire table (headers+rows) = 1 LDU.
+         │
+         ├─ chunk_type == "figure"  ──▶  R2: Absorb next block if it matches
+         │                               caption pattern (^Figure|Table \d+).
+         │                               Caption stored as "[Caption]: ..." in
+         │                               figure LDU content.
+         │
+         ├─ chunk_type == "list"    ──▶  R3: Keep as single LDU.
+         │                               Split only if > max_chars (1200).
+         │                               Split at line boundaries, not tokens.
+         │
+         └─ chunk_type == "text"    ──▶  R5: Scan for cross-references
+                                         (see Table 3, cf. Figure 2, etc.)
+                                         Store matches in provenance.meta
+                                         Buffer + merge up to max_chars.
+                                                   │
+                                                   ▼
+                                         ChunkValidator.validate(ldus)
+                                         → returns List[str] violations
+                                         → logged but non-blocking
+
+Each LDU carries:
+  ldu_id        content_hash    chunk_type
+  content       token_count     parent_section
+  page_refs     bounding_box    provenance: ProvenanceChain
+
+  Stage 4 — PageIndex Builder
