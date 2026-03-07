@@ -7,6 +7,14 @@ import yaml
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 
+# ✅ Load .env BEFORE Settings() is instantiated.
+# pydantic_settings reads from os.environ at __init__ time, so load_dotenv
+# must run first — otherwise OPENROUTER_API_KEY and other vars are invisible
+# to any module that imports `settings` directly (refinery_service, vision_vlm,
+# triage, etc.) without going through src/main.py.
+_env_file = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=_env_file, override=True)
+
 
 class Settings(BaseSettings):
     # Root directory of the repository (…/document-intelligence-refinery)
@@ -32,9 +40,4 @@ class Settings(BaseSettings):
         return yaml.safe_load(rubric_file.read_text(encoding="utf-8"))
 
 
-# ✅ This is what src/main.py expects to import
 settings = Settings()
-
-# Load .env from project root explicitly — works regardless of CWD.
-_env_file = Path(__file__).resolve().parents[1] / ".env"
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=True)

@@ -107,7 +107,7 @@ def query(
     if result.get("answer_snippets"):
         print("\n[dim]Raw evidence snippets:[/dim]")
         for i, snippet in enumerate(result["answer_snippets"], 1):
-            print(f"  [dim]{i}. {snippet[:200]}[/dim]")
+            print(f"  [dim]{i}. {snippet[:500]}[/dim]")
 
 
 @app.command()

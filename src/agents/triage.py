@@ -3,10 +3,11 @@ from __future__ import annotations
 import base64
 import json
 import os
-import urllib.request
+import ssl
 import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from src.models.profile import DocumentProfile
 from src.utils.pdf_signals import compute_pdf_signals
@@ -84,10 +85,12 @@ def _detect_language(text_sample: str) -> tuple[Optional[str], float]:
 
 # ── Image-based language detection (for scanned PDFs) ────────────────────────
 
-def _render_page_png_b64(pdf_path: str, page_index: int = 0, zoom: float = 1.5) -> Optional[str]:
+def _render_page_png_b64(pdf_path: str, page_index: int = 0, zoom: float = 0.8) -> Optional[str]:
     """
     Render a PDF page as a PNG and return base64-encoded bytes.
-    Uses pymupdf (already a project dependency via vision_vlm.py).
+    Zoom 0.8 keeps the image small enough (~100-200 KB) so the base64 payload
+    does not cause SSL EOF errors when sent to OpenRouter over urllib/httpx.
+    Language detection only needs to see script shapes, not fine detail.
     Returns None if rendering fails.
     """
     try:
@@ -98,7 +101,9 @@ def _render_page_png_b64(pdf_path: str, page_index: int = 0, zoom: float = 1.5) 
             page = doc.load_page(page_index)
             mat  = pymupdf.Matrix(zoom, zoom)
             pix  = page.get_pixmap(matrix=mat, alpha=False)
-            return base64.b64encode(pix.tobytes("png")).decode("ascii")
+            # Use JPEG instead of PNG — 3-5x smaller, more than good enough for
+            # language detection where we only need to identify script type.
+            return base64.b64encode(pix.tobytes("jpeg", jpg_quality=60)).decode("ascii")
     except Exception:
         return None
 
@@ -187,6 +192,46 @@ def _parse_lang_response(raw: str) -> Optional[str]:
     return None
 
 
+
+def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = 60) -> Optional[Dict]:
+    """
+    POST JSON payload to url. Returns parsed response dict, or None on failure.
+    Tries httpx first (better TLS handling for large image payloads), falls
+    back to urllib if httpx is not installed. Always logs the real error so
+    silent failures are visible in the console.
+    """
+    body = json.dumps(payload).encode("utf-8")
+
+    # ── Attempt 1: httpx (handles large multipart payloads reliably) ─────────
+    try:
+        import httpx as _httpx
+        with _httpx.Client(timeout=timeout, verify=True) as client:
+            resp = client.post(url, headers=headers, content=body)
+        if resp.status_code in (400, 401, 402, 403, 404, 422):
+            return {"http_status": resp.status_code, "reason": resp.text[:200]}
+        if resp.status_code in (429, 503, 529):
+            return {"http_status": resp.status_code, "reason": "rate_limit"}
+        resp.raise_for_status()
+        return resp.json()
+    except ImportError:
+        pass  # httpx not installed — fall through to urllib
+    except Exception as _e:
+        print(f"    [_post_json] httpx error: {type(_e).__name__}: {_e}")
+        return None
+
+    # ── Attempt 2: urllib fallback ────────────────────────────────────────────
+    try:
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return {"http_status": e.code, "reason": str(e.reason)}
+    except Exception as _e:
+        print(f"    [_post_json] urllib error: {type(_e).__name__}: {_e}")
+        return None
+
+
 def _detect_language_from_image(pdf_path: str) -> tuple[Optional[str], float]:
     """
     Detect language of a scanned PDF by sending page 1 image to the VLM.
@@ -203,9 +248,15 @@ def _detect_language_from_image(pdf_path: str) -> tuple[Optional[str], float]:
         # No API key — return None gracefully, pipeline continues without language
         return None, 0.0
 
-    img_b64 = _render_page_png_b64(pdf_path, page_index=0, zoom=1.5)
+    img_b64 = _render_page_png_b64(pdf_path, page_index=0, zoom=0.8)
     if not img_b64:
         return None, 0.0
+
+    # Warn if image is large — payloads over ~400KB can trigger SSL EOF
+    payload_kb = len(img_b64) * 3 / 4 / 1024  # base64 → bytes estimate
+    print(f"  [triage-lang] image payload ~{payload_kb:.0f} KB (zoom=0.8, JPEG q=60)")
+    if payload_kb > 500:
+        print(f"  [triage-lang] WARNING: large payload may fail — run: pip install httpx")
 
     base_url = os.getenv("OPENROUTER_URL", os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
     headers  = {
@@ -222,24 +273,26 @@ def _detect_language_from_image(pdf_path: str) -> tuple[Optional[str], float]:
                 "role": "user",
                 "content": [
                     {"type": "text",      "text": _LANG_PROBE_PROMPT},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
                 ],
             }],
         }
         try:
-            req = urllib.request.Request(
+            data = _post_json(
                 url=f"{base_url.rstrip('/')}/chat/completions",
-                data=json.dumps(payload).encode(),
                 headers=headers,
-                method="POST",
+                payload=payload,
+                timeout=60,
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode())
+            if data is None:
+                print(f"  [triage-lang] model={model} — request failed, trying next")
+                continue
+            if "http_status" in data:
+                print(f"  [triage-lang] model={model} HTTP {data['http_status']} — skipping")
+                continue
             raw = (data["choices"][0]["message"]["content"] or "").strip()
             print(f"  [triage-lang] model={model} raw response: {raw[:120]!r}")
 
-            # Parse response — VLMs return many formats: JSON, prose, bare code.
-            # Use a multi-strategy parser so any format succeeds.
             lang = _parse_lang_response(raw)
             print(f"  [triage-lang] parsed lang={lang!r}")
 
@@ -252,16 +305,6 @@ def _detect_language_from_image(pdf_path: str) -> tuple[Optional[str], float]:
             if lang and lang != "other":
                 return lang, 0.75
 
-        except urllib.error.HTTPError as e:
-            body = ""
-            try:
-                body = e.read().decode()[:300]
-            except Exception:
-                pass
-            print(f"  [triage-lang] model={model} HTTP {e.code}: {body}")
-            if e.code in (429, 503, 529, 400, 404, 422):
-                continue
-            break
         except Exception as _ex:
             print(f"  [triage-lang] model={model} error: {type(_ex).__name__}: {_ex}")
             continue

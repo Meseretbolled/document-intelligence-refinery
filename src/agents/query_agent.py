@@ -15,7 +15,7 @@ from src.models.provenance import ProvenanceChain, ProvenanceSpan
 
 # ── LLM helper ────────────────────────────────────────────────────────────────
 
-def _call_openrouter(prompt: str, max_tokens: int = 20) -> str:
+def _call_openrouter(prompt: str, max_tokens: int = 512) -> str:
     """
     Call OpenRouter. Returns text content or empty string on any failure.
     Requires OPENROUTER_API_KEY environment variable.
@@ -108,7 +108,7 @@ class VectorStore:
                 content = (ldu.content or "").strip()
                 if not content:
                     continue
-                to_add_docs.append(content[:2000])
+                to_add_docs.append(content[:8000])
                 to_add_ids.append(ldu.ldu_id)
                 to_add_metas.append({
                     "doc_id": ldu.doc_id,
@@ -496,7 +496,7 @@ class QueryAgent:
         evidence_parts = []
         for i, s in enumerate(snippets, 1):
             if s.strip():
-                evidence_parts.append(f"[Evidence {i}]\n{s.strip()[:600]}")
+                evidence_parts.append(f"[Evidence {i}]\n{s.strip()[:1500]}")
 
         if structured_facts:
             facts_text = "\n".join(
@@ -526,13 +526,13 @@ class QueryAgent:
         api_key = os.getenv("OPENROUTER_API_KEY", "")
         if not api_key:
             # No API key — return best snippet as fallback
-            return snippets[0][:500] if snippets else "No content retrieved."
+            return snippets[0][:1000] if snippets else "No content retrieved."
 
-        synthesized = _call_openrouter(prompt, max_tokens=300)
+        synthesized = _call_openrouter(prompt, max_tokens=600)
 
         if not synthesized:
             # API call failed — return best snippet
-            return snippets[0][:500] if snippets else "No content retrieved."
+            return snippets[0][:1000] if snippets else "No content retrieved."
 
         return synthesized
 
